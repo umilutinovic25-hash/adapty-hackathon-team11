@@ -3,8 +3,12 @@
 **Before going on stage**
 - `uv run python -m pa.cli check` (fresh report), then `uv run streamlit run app.py`
 - Tabs, in this order: slide · Streamlit app · Adapty dashboard → A/B tests (Lumen) · terminal with Claude Code
-- **Never click "Stop test" in rehearsal**: a stop can't be undone. For a full rehearsal, seed a second app.
-- Backup: a screen recording of the stop flow, in case Wi-Fi or the Adapty API is down.
+- **Rehearse only on "Lumen BACKUP"** (app selector): start the app with
+  `OFFLINE_APP_IDS=f414265a-e67a-41ce-85b1-c4c1d02c3816,df26756a-b66a-42ee-a1de-365829b7114d uv run streamlit run app.py`.
+  Its Main test was already stopped in rehearsal (7 Nov, 13:10); its **Onboarding** test is still free for one more
+  run. **Never click Stop on the main Lumen app before the demo.**
+- On stage, select **Lumen - AI Photo Editor (Hackathon)** (the default).
+- Backup: `~/Downloads/experiment_autopilot_demo_backup.gif` (flow up to approval), in case Wi-Fi or the Adapty API is down.
 
 | Time | Screen | Say (approximately) |
 |---|---|---|
@@ -14,7 +18,7 @@
 | 2:15–3:00 | Onboarding card → ⏱️ warning + *Revenue maturity* | "Onboarding: Weekly wins on matured revenue too, +90%. Our maturity check shows why the dashboard looked so sure: by day 1 Weekly has 46% of its revenue and Annual trial 0%. Here the early read happened to be right. In another app the same bias picks the wrong winner." |
 | 3:00–3:20 | Segments expander | "Is one winner right for everyone? Our intent model splits users into low, mid and high purchase intent, plus platform and channel. Onboarding: the winner is clearly ahead in all 10 segments. Main: no segment reverses; 2 are too small to tell. Bonferroni-corrected." |
 | 3:20–3:35 | Top metric + Settings + Draft cards | "Together: **≈$1,749 a month**, a quarter of MRR. Bonus: the completed Settings test isn't significant at all, and the AI-limit draft would need ~1,500 days at this traffic. Don't start it as designed." |
-| 3:35–4:30 | Main card → Change Guard → tick → **Stop** (≈15 s fresh re-check) → Adapty refresh | "The agent never acts alone: what changes, who's affected, dollar effect, can't be undone. I approve. *(click)* It re-checks on fresh data first, so a stale plan can't ship. … *(card turns to completed; dashboard)* Winner rolled out, and it's in the audit log." |
+| 3:35–4:30 | Main card → Change Guard → tick → **Stop** (≈8 s fresh re-check) → Adapty refresh | "The agent never acts alone: what changes, who's affected, dollar effect, can't be undone. I approve. *(click)* It re-checks on fresh data first, so a stale plan can't ship. … *(card turns to completed; dashboard)* Winner rolled out, and it's in the audit log." |
 | 4:30–5:00 | Slack digest expander → slide 2 | "It runs without anyone opening a dashboard: a daily Slack digest, a portfolio scan across apps, and a Claude Code skill that asks before it touches anything. Business: it belongs inside Adapty next to Autopilot. Autopilot proposes the next test, we close the running ones. Who: growth teams. What changes: money and risk. Why Adapty: we read its tests and act through its CLI." |
 
 ## Likely jury questions
