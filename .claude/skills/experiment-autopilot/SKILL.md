@@ -10,9 +10,13 @@ Works from the repository root with the Adapty CLI logged in (`adapty auth login
 ## 1. Read the state (no side effects)
 
 ```bash
-uv run python -m pa.cli check          # Markdown brief of every test
+uv run python -m pa.cli check          # Markdown brief of every test (add --app <id> for another app)
 uv run python -m pa.cli check --json   # full numbers when you need them
+uv run python -m pa.cli portfolio      # every app the account can open: decided tests and money at stake
+uv run python -m pa.cli notify         # Slack digest; posts only if SLACK_WEBHOOK_URL is set, else a preview
 ```
+
+Apps without user→arm history show tests as `unsupported` with what Adapty sees. Say that plainly; don't judge them.
 
 Explain the brief in plain language, test by test. Lead with money: what each decided live test costs per month.
 Always mention:

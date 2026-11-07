@@ -30,6 +30,8 @@ def fake_run(*args):
         return PLACEMENTS
     if args[:2] == ("analytics", "chart"):
         return {"data": {"segments": []}}
+    if args[:3] == ("flows", "metrics", "get"):
+        return {"data": {"items": []}}
     raise AssertionError(f"unexpected CLI call {args}")
 
 
@@ -156,3 +158,60 @@ def test_old_report_schema_is_rebuilt(mocked):
     Path("out").mkdir()
     Path("out/report.json").write_text(json.dumps({"tests": []}))  # written by an older version
     assert cli.report(fresh=False)["schema"] == experiments.REPORT_SCHEMA
+
+
+def test_live_view_counts_only_users_inside_the_test(monkeypatch):
+    tree = {"data": {"items": [
+        {"level": "audience", "title": "All Users", "unique_profiles_views": 135, "revenue": 36.0, "items": []},
+        {"level": "audience", "title": "US & Canada", "items": [
+            {"level": "ab_test", "title": MAIN, "unique_profiles_views": 40, "revenue": 63.0, "trials": 2,
+             "trials_finished": 0, "purchases": 3}]}]}}
+    monkeypatch.setattr(adapty_cli, "run", lambda *a: tree)
+    m = experiments.flow_live_metrics("flow-a", MAIN, "2026-11-06")
+    assert m["users"] == 40 and m["revenue"] == 63.0 and m["rev_per_user"] == pytest.approx(63 / 40, abs=0.01)
+
+
+def test_other_apps_have_no_borrowed_history(mocked, monkeypatch):
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"},
+                                                         {"id": "other-app", "title": "Other"}])
+    rows = {r["app"]: r for r in experiments.portfolio()}
+    assert rows["Lumen"]["has_history"] and rows["Lumen"]["decided_live"] == 2
+    assert not rows["Other"]["has_history"] and rows["Other"]["decided_live"] == 0  # same tests, but no history
+    assert Path("out/report-other-app.json").exists()
+
+
+def test_slack_digest_lists_decided_tests_without_posting(mocked, monkeypatch):
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+    from pa import notify
+    r = experiments.build_report()
+    res = notify.send(r)
+    msg = json.loads(Path("out/slack_message.json").read_text())
+    assert res["sent"] is False and "2 live test(s) are decided" in json.dumps(msg)
+
+
+def test_three_arm_test_compares_winner_with_runner_up(monkeypatch):
+    import numpy as np
+    import pandas as pd
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    rng = np.random.default_rng(1)
+    rows = []
+    for code, mean in [("a", 4.0), ("b", 8.0), ("c", 10.0)]:
+        for i in range(600):
+            rows.append({"user_id": f"{code}{i}", "ab_test": "T3", "flow": code, "matured": True,
+                         "revenue": float(rng.exponential(mean)), "payer": 1, "intent_score": rng.random(),
+                         "intent": "mid", "platform": "iOS", "acquisition_channel": "organic",
+                         "install_at": pd.Timestamp("2026-08-01") + pd.Timedelta(days=i % 60)})
+    u = pd.DataFrame(rows)
+    t = pd.DataFrame({"user_id": u.user_id, "paid": True, "refunded_at": pd.NaT, "billing_issue_detected_at": pd.NaT,
+                      "price_usd": u.revenue, "day": 0.5})
+    test = {"ab_test_id": "t3", "title": "T3", "state": "live", "type": "flow", "goal": None, "segment_ids": [],
+            "started_at": None, "placement": {"title": "P", "placement_id": "p"},
+            "flows": [{"flow_name": n, "flow_id": n, "weight": 33} for n in ("A", "B", "C")]}
+    res = experiments.judge(test, u, t, {"a": "A", "b": "B", "c": "C"})
+    assert res["winner"]["name"] == "C" and res["loser"]["name"] == "B" and [o["name"] for o in res["others"]] == ["A"]
+    assert res["losing_share"] == pytest.approx(2 / 3, abs=0.01)
+
+
+def test_horizon_comes_from_the_test_goal():
+    assert experiments.horizon_of({"goal": "maximise 30-day revenue per install"}) == 30
+    assert experiments.horizon_of({"goal": "no horizon here"}) == experiments.HORIZON_DAYS
