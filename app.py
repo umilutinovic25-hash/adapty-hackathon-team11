@@ -17,7 +17,7 @@ from pa.experiments import REPORT_SCHEMA, build_report, mark_stopped, portfolio,
 
 st.set_page_config(page_title="Experiment Autopilot", page_icon="🧪", layout="wide")
 VERDICT = {
-    "stop_and_roll_out": ("🛑 Decided — stop and roll out the winner", "error"),
+    "stop_and_roll_out": ("💰 Decided — stop and roll out the winner", "warning"),
     "split_by_segment": ("🔀 Winner differs by segment — split the audience", "warning"),
     "guardrail_failed": ("🚧 Winner on revenue, but a guardrail got worse — review before rollout", "warning"),
     "check_data": ("🧯 Data health check failed — fix the split before trusting results", "warning"),
@@ -27,6 +27,10 @@ VERDICT = {
     "draft_plan": ("📐 Draft — sample-size plan before you start", "info"),
     "unsupported": ("➖ Can't judge on history yet — showing what Adapty sees", "info"),
 }
+SHORT = {"stop_and_roll_out": "💰 stop & roll out", "split_by_segment": "🔀 split by segment",
+         "guardrail_failed": "🚧 guardrail failed", "check_data": "🧯 check data", "keep_running": "⏳ keep running",
+         "completed_confirmed": "✅ confirmed", "completed_inconclusive": "⚠️ not significant",
+         "draft_plan": "📐 don't start" , "unsupported": "➖ no history"}
 
 
 @st.cache_data(show_spinner="Reading Adapty tests and 4 months of history…", max_entries=4)
@@ -44,9 +48,10 @@ def report_mtime(path: Path) -> int:
 @st.cache_data(ttl=600)
 def apps() -> list[dict]:
     try:
-        return adapty_cli.list_apps()
-    except adapty_cli.AdaptyError:
-        return [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Default app"}]
+        found = adapty_cli.list_apps()
+    except Exception:  # noqa: BLE001 - offline demo: CLI missing, no network, odd output
+        found = []
+    return found or [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Default app (offline)"}]
 
 
 def bar(df: pd.DataFrame, x: str, y: str, x_title: str, y_title: str, fmt: str = ",.2f") -> alt.Chart:
@@ -60,24 +65,39 @@ if "log" not in st.session_state:
     st.session_state.log = []
 
 st.title("🧪 Experiment Autopilot for Adapty")
-st.caption("Adapty's A/B page judges a test from the day it starts: before trial revenue has arrived and without "
-           "the months of history before it. We judge every test on matured 60-day revenue over 4 months of history, "
-           "run the health checks of experimentation platforms (split, balance, guardrails, maturity, segments), and "
-           "stop decided tests in Adapty — only after a human approves.")
+st.caption("Adapty reads A/B tests from the day they start. We read them on matured revenue over the full history, "
+           "and stop decided ones only after a human approves.")
+with st.expander("How we judge a test"):
+    st.markdown("- **Matured revenue:** 60-day net revenue per user (trials $0, refunds out), only users whose 60 days "
+                "have passed, over 4 months of history\n- **Health:** traffic split (SRM) and randomization balance\n"
+                "- **Guardrails:** refund and billing-issue rate per charge\n- **Maturity:** how much revenue each arm "
+                "has collected by day 1/7/30\n- **Segments:** intent model, platform, channel (Bonferroni)\n"
+                "- **Change Guard:** plan, human approval, fresh re-check, audit log")
 app_list = apps()
-default_idx = next((i for i, a in enumerate(app_list) if a["id"] == adapty_cli.DEFAULT_APP_ID), 0)
+wanted = st.query_params.get("app", adapty_cli.DEFAULT_APP_ID)
+default_idx = next((i for i, a in enumerate(app_list) if a["id"] == wanted), 0)
 top1, top2 = st.columns([3, 2])
 app = top1.selectbox("Adapty app", app_list, index=default_idx, format_func=lambda a: a["title"])
 APP_ID = app["id"]
 REPORT = report_path(APP_ID)
+
+
+def safe_build(why: str) -> None:
+    with st.spinner(why):
+        try:
+            build_report(APP_ID)
+        except Exception as err:  # noqa: BLE001 - keep showing the last saved report when Adapty is unreachable
+            st.warning(f"Couldn't reach Adapty ({err}). Showing the last saved analysis.")
+    load_report.clear()
+
+
 if top2.button("↻ Re-run analysis (Adapty CLI + offline history)", use_container_width=True):
-    with st.spinner("Reading Adapty tests and 4 months of history…"):
-        build_report(APP_ID)
-    load_report.clear()
+    safe_build("Reading Adapty tests and 4 months of history…")
 if not REPORT.exists() or json.loads(REPORT.read_text()).get("schema") != REPORT_SCHEMA:
-    with st.spinner("First run for this app: reading Adapty tests and history…"):
-        build_report(APP_ID)
-    load_report.clear()
+    safe_build("First run for this app: reading Adapty tests and history…")
+if not REPORT.exists():
+    st.error("No analysis yet and Adapty is unreachable. Connect and press Re-run.")
+    st.stop()
 r = load_report(str(REPORT), report_mtime(REPORT))
 if st.session_state.get("flash"):
     st.success(st.session_state.pop("flash"))
@@ -88,12 +108,17 @@ if not r.get("has_history", True):
 tests = r["tests"]
 live = [t for t in tests if t["state"] == "live"]
 decided = [t for t in live if t["verdict"] == "stop_and_roll_out"]
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Live tests", len(live))
-c2.metric("Decided, still running", len(decided))
-c3.metric("Revenue lost per month", f"${r['total_lost_per_month_usd']:,.0f}",
-          help="One month of new installs on the losing arms, each followed for 60 days (Lumen scale).")
-c4.metric("Judged on", f"{r['horizon_days']}-day revenue")
+hero, c2, c3 = st.columns([2, 1, 1])
+share = (f" · ≈{r['total_lost_per_month_usd'] / r['mrr_usd']:.0%} of today's MRR (${r['mrr_usd']:,.0f})"
+         if r.get("mrr_usd") else "")
+hero.markdown(f"<div style='font-size:15px;opacity:.75'>Lost per month on decided tests that still split traffic</div>"
+              f"<div style='font-size:56px;font-weight:700;color:#F2A65A;line-height:1.1'>"
+              f"${r['total_lost_per_month_usd']:,.0f}</div>"
+              f"<div style='font-size:15px;opacity:.75'>{len(decided)} of {len(live)} live tests decided{share}</div>",
+              unsafe_allow_html=True)
+c2.metric("Early reads that are immature", sum(1 for t in live if (t.get("live_view") or {}).get("immature")),
+          help="Live tests where most trials in Adapty haven't finished yet")
+c3.metric("Completed but not significant", sum(1 for t in tests if t["verdict"] == "completed_inconclusive"))
 names = r.get("segment_names", {})
 
 
@@ -118,12 +143,15 @@ def our_view(t: dict) -> str:
 
 
 st.dataframe(pd.DataFrame([{
-    "test": t["title"], "state": t["state"],
-    "Adapty since start (revenue/arm)": adapty_view(t),
-    f"Matured {r['horizon_days']}-day revenue": our_view(t),
-    "verdict": VERDICT.get(t["verdict"], (t["verdict"],))[0],
+    "test": t["title"],
+    "verdict": SHORT.get(t["verdict"], t["verdict"]),
     "$ / month": f"${t['lost_per_month_usd']:,.0f}" if t["state"] == "live" and t.get("lost_per_month_usd") else "",
-} for t in tests]), hide_index=True, use_container_width=True)
+    f"matured {t['horizon_days']}-day": our_view(t),
+    "Adapty right now": adapty_view(t),
+} for t in tests]), hide_index=True, use_container_width=True,
+    column_config={"test": st.column_config.TextColumn(width="medium"),
+                   "verdict": st.column_config.TextColumn(width="small"),
+                   "$ / month": st.column_config.TextColumn(width="small")})
 
 for t in tests:
     label, kind = VERDICT.get(t["verdict"], (t["verdict"], "info"))
@@ -158,8 +186,11 @@ for t in tests:
             c.markdown(f"- Cost of keeping it running: **${t['lost_per_month_usd']:,.0f}/month**")
 
         lv = t.get("live_view")
-        if lv:
-            st.markdown(f"**What Adapty sees since {lv['since']} (users in this test only):** {adapty_view(t)}")
+        left, right = st.columns(2)
+        left.info(f"**Adapty right now** (since {lv['since']}, users in this test only)\n\n{adapty_view(t)}"
+                  if lv else "**Adapty right now**\n\nno live data for this test yet")
+        right.success(f"**Matured {t['horizon_days']}-day revenue, full history**\n\n{our_view(t)} · "
+                      f"95% CI ${t['diff_ci95'][0]:.2f}…${t['diff_ci95'][1]:.2f} per user")
         if t["maturity"]["early_bias"]:
             live_note = (f" Right now in Adapty, {lv['trials_finished']} of {lv['trials']} trials in this test have "
                          f"finished." if lv and lv.get("trials") else "")
@@ -179,12 +210,12 @@ for t in tests:
                 {"metric": "billing-issue rate", "winner": f"{g['winner']['billing_issue_rate']:.2%}",
                  "other": f"{g['other']['billing_issue_rate']:.2%}", "p": g["billing_p"]}]), hide_index=True)
         with h3.expander("Revenue maturity"):
-            mat = pd.DataFrame([{"day": int(d), "arm": arm, "share of 60-day revenue": share}
+            mat = pd.DataFrame([{"day": int(d), "arm": arm, "share": share}
                                 for k, arm in [("winner", t["winner"]["name"]), ("other", t["loser"]["name"])]
                                 for d, share in t["maturity"][k].items()])
             st.altair_chart(alt.Chart(mat).mark_line(point=True).encode(
                 x=alt.X("day:O", title="days since install", axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("share of 60-day revenue:Q", title="revenue collected",
+                y=alt.Y("share:Q", title=f"share of {t['horizon_days']}-day revenue",
                         scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%", tickCount=5)),
                 color=alt.Color("arm:N", legend=alt.Legend(orient="bottom", title=None, columns=1))
             ).properties(height=300),
@@ -208,8 +239,9 @@ for t in tests:
                 f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} new users/day).\n"
                 f"- **Expected effect:** +${t['lost_per_month_usd']:,.0f}/month in {t['horizon_days']}-day revenue.\n"
                 f"- **Can't be undone:** a stopped test can't restart; to test again, create a copy.")
-            with adapty_cli.use_app(APP_ID):
-                st.code(" ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"])), language="bash")
+            with st.expander("Show the Adapty CLI command"):
+                st.code(" ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"], app_id=APP_ID)),
+                        language="bash")
             ok = st.checkbox("I reviewed the plan and approve stopping this test", key=f"ok-{t['ab_test_id']}")
             if st.button("Stop test & roll out winner", key=f"go-{t['ab_test_id']}", disabled=not ok, type="primary"):
                 try:
@@ -220,8 +252,7 @@ for t in tests:
                         load_report.clear()
                         raise RuntimeError("the fresh data no longer supports this plan (test changed or another "
                                            "winner); review the updated card and approve again")
-                    with adapty_cli.use_app(APP_ID):
-                        res = adapty_cli.stop_test(t["ab_test_id"], t["winner"]["content_id"])
+                    res = adapty_cli.stop_test(t["ab_test_id"], t["winner"]["content_id"], app_id=APP_ID)
                     entry = {"at": pd.Timestamp.now(tz="UTC").isoformat(), "approved_by": "dashboard user",
                              "action": "stop", "app_id": APP_ID, "test": t["title"], "winner": t["winner"]["name"],
                              "result": res}
