@@ -21,6 +21,17 @@ Claude Code skill gives the same functions to an AI agent, with the same approva
 **≈ $1,749/month** on the losing arms of the two live tests: one month of new installs, each followed for 60 days,
 at Lumen scale. That is about a quarter of Lumen's $6.4k MRR.
 
+## Business case
+
+- **Buyer:** growth teams on Adapty that run paywall and onboarding experiments, from one app to a portfolio.
+- **Value:** on Lumen, ≈$1,749/month on losing arms of decided tests (≈ a quarter of MRR), plus fewer rollouts of
+  winners that were not significant (the Settings test).
+- **Model:** a native Adapty feature next to Autopilot. Autopilot proposes the *next* test; Experiment Autopilot
+  *closes* running ones safely. That makes Adapty's experimentation loop end-to-end and is a natural paid-tier
+  feature. A standalone add-on on top of the Adapty CLI/MCP is also possible.
+- **Next step:** read user→arm history from Adapty's S3/BigQuery export, so it works on every app, not just the
+  seeded one.
+
 ## Who it is for
 
 Growth and product people running paywall and onboarding experiments in Adapty. Today they read the A/B page, which
@@ -30,8 +41,10 @@ approval).
 
 ## How it works
 
-1. **Adapty CLI**: `ab-tests list/get` for tests, arms, weights and audiences; `analytics chart --group-by flow_id
-   --filter placement_id=…` for what the dashboard sees since the test started (the "live view").
+1. **Adapty CLI**: `ab-tests list/get` for tests, arms, weights and audiences. `flows metrics get --based-on
+   audience` gives the live view: users, revenue, trials and **finished** trials per arm since the test started,
+   counting only users inside the test, because the same flow can also be shown outside it. The numbers match the
+   dashboard.
 2. **Full history**: the offline dataset says which arm every user saw. Net revenue in the first 60 days counts
    trials as $0 and removes refunds, and only users whose 60 days have passed are included.
 3. **Decision**: revenue per user per arm, bootstrap 95% CI, P(winner better).
@@ -43,7 +56,10 @@ approval).
    ≥ 25 points on day 1, an immature-revenue warning explains which arm an early read favours.
 7. **Segments**: the same comparison inside intent (low/mid/high from a cross-fitted gradient-boosting model on
    day-one signals), platform and acquisition channel, Bonferroni-corrected.
-8. **Planning**: sample size for a 10% lift, days to a decision, and the smallest lift visible in 30 days.
+8. **Planning**: sample size for a 10% lift, days to a decision, and the smallest lift visible in 30 days, using
+   only the traffic of the draft's own placement.
+   Tests with 3+ arms compare the winner with the runner-up and count money on every losing arm. The revenue horizon
+   is read from the test goal ("…60-day revenue…"), with 60 days as the default.
 9. **Change Guard**: shows what changes, the audience, who is affected, the expected effect, and that a stop can't be
    undone. After approval it runs `adapty ab-tests stop <id> --winner <id>` and appends to `out/audit.log`.
 
@@ -54,7 +70,9 @@ cp .env.example .env                 # app id + path to the seed repo's data/off
 npm i -g adapty && adapty auth login
 uv sync
 uv run python -m pa.cli check        # Markdown brief (writes out/report.json)
-uv run streamlit run app.py          # dashboard
+uv run python -m pa.cli portfolio    # every app the Adapty account can open
+uv run python -m pa.cli notify       # Slack digest: posts if SLACK_WEBHOOK_URL is set, else saves a preview
+uv run streamlit run app.py          # dashboard (app selector, Slack preview, portfolio scan)
 sh .claude/verify.sh                 # checks; asserts the pre-demo verdicts, so it fails once a test is stopped
 ```
 
@@ -65,8 +83,9 @@ sh .claude/verify.sh                 # checks; asserts the pre-demo verdicts, so
 refuses if the verdict changed or the fresh winner differs from the approved one, then writes the audit log. The
 dashboard's Stop button applies the same fresh re-check.
 
-Tests: `uv run pytest` (13 behaviour tests, Adapty CLI mocked from fixtures; includes the post-stop state, a stale
-approval, paywall tests and odd arm weights).
+Tests: `uv run pytest` runs 18 behaviour tests with the Adapty CLI mocked from fixtures. They cover the post-stop
+state, a stale approval, paywall tests, odd arm weights, 3-arm tests, other apps without history, test-only live
+metrics and the Slack digest.
 
 ## Limits
 
