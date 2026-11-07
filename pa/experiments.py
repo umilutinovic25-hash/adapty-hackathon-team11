@@ -51,7 +51,9 @@ def flow_names() -> dict[str, str]:
 
 
 REPORT_SCHEMA = 4  # bump when the report's keys change; readers rebuild older reports
-OFFLINE_APP_ID = os.getenv("OFFLINE_APP_ID", "f414265a-e67a-41ce-85b1-c4c1d02c3816")  # app the offline data seeded
+# apps seeded from the offline dataset (comma-separated), e.g. the demo app and a rehearsal copy
+OFFLINE_APP_IDS = {a.strip() for a in os.getenv("OFFLINE_APP_IDS", os.getenv(
+    "OFFLINE_APP_ID", "f414265a-e67a-41ce-85b1-c4c1d02c3816")).split(",") if a.strip()}
 
 
 def placement_codes() -> dict[str, str]:
@@ -386,7 +388,7 @@ def report_path(app_id: str | None = None) -> Path:
 def build_report(app_id: str | None = None) -> dict:
     app_id = app_id or adapty_cli.DEFAULT_APP_ID
     with adapty_cli.use_app(app_id):
-        has_history = app_id == OFFLINE_APP_ID  # the offline user→arm history belongs to the seeded Lumen app
+        has_history = app_id in OFFLINE_APP_IDS  # the offline user→arm history belongs to the seeded app(s)
         datasets: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
         base_u, base_t, end = load(HORIZON_DAYS)
         base_u = add_intent(base_u)
@@ -402,12 +404,13 @@ def build_report(app_id: str | None = None) -> dict:
             return datasets[h]
 
         names, placements = flow_names(), placement_codes()
-        judged = []
-        for tst in adapty_cli.list_tests():
-            if tst["state"] in ("live", "completed", "draft"):
-                u, t = data_for(horizon_of(tst))
-                if (res := judge(tst, u, t, names, placements)) is not None:
-                    judged.append(res)
+        tests = [x for x in adapty_cli.list_tests() if x["state"] in ("live", "completed", "draft")]
+        for tst in tests:  # build the per-horizon datasets up front, before running judges in threads
+            data_for(horizon_of(tst))
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+        with ThreadPoolExecutor(max_workers=4) as pool:  # judges wait on Adapty CLI calls (live view)
+            results = list(pool.map(lambda x: judge(x, *data_for(horizon_of(x)), names, placements), tests))
+        judged = [res for res in results if res is not None]
         m = base_u[base_u.matured]
         bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
         report = {
@@ -428,6 +431,19 @@ def build_report(app_id: str | None = None) -> dict:
     OUT.mkdir(exist_ok=True)
     write_atomic(report_path(app_id), json.dumps(report, indent=2))
     return report
+
+
+def mark_stopped(app_id: str, test_id: str) -> dict:
+    """After a confirmed stop, update the saved report without re-running the whole analysis."""
+    path = report_path(app_id)
+    r = json.loads(path.read_text())
+    for t in r["tests"]:
+        if t["ab_test_id"] == test_id:
+            t["state"], t["verdict"] = "completed", "completed_confirmed"
+    r["total_lost_per_month_usd"] = round(sum(x.get("lost_per_month_usd", 0) for x in r["tests"]
+                                              if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2)
+    write_atomic(path, json.dumps(r, indent=2))
+    return r
 
 
 def portfolio() -> list[dict]:

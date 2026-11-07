@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from pa import adapty_cli, notify
-from pa.experiments import REPORT_SCHEMA, build_report, portfolio, report_path
+from pa.experiments import REPORT_SCHEMA, build_report, mark_stopped, portfolio, report_path
 
 st.set_page_config(page_title="Experiment Autopilot", page_icon="🧪", layout="wide")
 VERDICT = {
@@ -228,7 +228,7 @@ for t in tests:
                     st.session_state.log.append(entry)
                     with Path("out/audit.log").open("a") as f:
                         f.write(json.dumps(entry) + "\n")
-                    build_report(APP_ID)  # the card now shows the test as completed; no second click possible
+                    mark_stopped(APP_ID, t["ab_test_id"])  # card turns to completed; no second click possible
                     load_report.clear()
                     st.session_state.flash = f"Stopped “{t['title']}” in Adapty — {t['winner']['name']} rolled out."
                     st.rerun()

@@ -48,8 +48,10 @@ def list_apps() -> list[dict]:
 
 
 def list_tests() -> list[dict]:
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
     tests = run("ab-tests", "list")["data"]
-    return [run("ab-tests", "get", t["ab_test_id"]) for t in tests]
+    with ThreadPoolExecutor(max_workers=8) as pool:  # each CLI call is ~0.5 s of waiting
+        return list(pool.map(lambda t: run("ab-tests", "get", t["ab_test_id"]), tests))
 
 
 def stop_command(test_id: str, winner_id: str) -> list[str]:

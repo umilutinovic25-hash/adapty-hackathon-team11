@@ -215,3 +215,11 @@ def test_three_arm_test_compares_winner_with_runner_up(monkeypatch):
 def test_horizon_comes_from_the_test_goal():
     assert experiments.horizon_of({"goal": "maximise 30-day revenue per install"}) == 30
     assert experiments.horizon_of({"goal": "no horizon here"}) == experiments.HORIZON_DAYS
+
+
+def test_mark_stopped_updates_card_and_money_without_rebuilding(mocked):
+    experiments.build_report()
+    onb_id = next(x["ab_test_id"] for x in TESTS if x["title"] == ONB)
+    r = experiments.mark_stopped(adapty_cli.DEFAULT_APP_ID, onb_id)
+    assert by_title(r)[ONB]["verdict"] == "completed_confirmed"
+    assert r["total_lost_per_month_usd"] == pytest.approx(353.63, abs=1)
