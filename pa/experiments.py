@@ -50,7 +50,8 @@ def flow_names() -> dict[str, str]:
     return {**FALLBACK_FLOW_NAMES, **found}  # a flow the regex misses still maps
 
 
-REPORT_SCHEMA = 3  # bump when the report's keys change; readers rebuild older reports
+REPORT_SCHEMA = 4  # bump when the report's keys change; readers rebuild older reports
+OFFLINE_APP_ID = os.getenv("OFFLINE_APP_ID", "f414265a-e67a-41ce-85b1-c4c1d02c3816")  # app the offline data seeded
 
 
 def placement_codes() -> dict[str, str]:
@@ -97,13 +98,6 @@ def boot(a: np.ndarray, b: np.ndarray, n: int = 3000, alpha: float = 0.05) -> tu
     return (float(np.percentile(d, 100 * alpha / 2)), float(np.percentile(d, 100 * (1 - alpha / 2))),
             float((d > 0).mean()))
 
-
-def two_prop_p(x1: int, n1: int, x2: int, n2: int) -> float:
-    if min(n1, n2) == 0:
-        return 1.0
-    p = (x1 + x2) / (n1 + n2)
-    se = np.sqrt(p * (1 - p) * (1 / n1 + 1 / n2)) or 1e-12
-    return float(2 * stats.norm.sf(abs(x1 / n1 - x2 / n2) / se))
 
 
 def sample_size_per_arm(values: np.ndarray, mde: float = MDE, alpha: float = 0.05, power: float = 0.8) -> int:
@@ -161,20 +155,60 @@ def guardrails(t: pd.DataFrame, users: pd.Series) -> dict:
             "billing_issue_rate": round(float(tx.billing_issue_detected_at.notna().mean()), 4) if n else 0.0}
 
 
-def live_view(test: dict, arms: list[dict]) -> dict | None:
-    """What the Adapty dashboard sees: revenue per arm since the test started (Adapty analytics API)."""
-    try:
-        start = test["started_at"][:10] if test.get("started_at") else None
-        if not start:
-            return None
-        group = "flow_id" if test["type"] == "flow" else "paywall_id"
-        res = adapty_cli.run("analytics", "chart", "--chart", "revenue", "--date-from", start,
-                             "--date-to", date.today().isoformat(), "--group-by", group,
-                             "--filter", f"placement_id={test['placement']['placement_id']}")
-        by_id = {s["key"]: s["value"] for s in res["data"]["segments"] if not s["is_total"]}
-        return {"since": start, "revenue": {a["name"]: round(float(by_id.get(a["content_id"], 0.0)), 2) for a in arms}}
-    except (RuntimeError, KeyError, ValueError):
+def _find(node: dict, level: str, title: str) -> dict | None:
+    if node.get("level") == level and node.get("title") == title:
+        return node
+    for child in node.get("items", []):
+        if (hit := _find(child, level, title)) is not None:
+            return hit
+    return None
+
+
+def flow_live_metrics(flow_id: str, test_title: str, start: str) -> dict | None:
+    """One arm as the Adapty flow metrics page shows it, counting ONLY users inside this A/B test: the same flow can
+    also be shown outside the test (e.g. to other audiences at the same placement)."""
+    res = adapty_cli.run("flows", "metrics", "get", flow_id, "--date-type", "profile_install_date",
+                         "--based-on", "audience", "--date-from", start, "--date-to", date.today().isoformat())
+    item = _find(res["data"], "ab_test", test_title)
+    if item is None:
         return None
+    users = int(item.get("unique_profiles_views") or 0)
+    return {"users": users, "revenue": round(float(item.get("revenue") or 0), 2),
+            "rev_per_user": round(float(item.get("revenue") or 0) / users, 2) if users else 0.0,
+            "trials": int(item.get("trials") or 0), "trials_finished": int(item.get("trials_finished") or 0),
+            "purchases": int(item.get("purchases") or 0)}
+
+
+def live_view(test: dict, arms: list[dict]) -> dict | None:
+    """What the Adapty dashboard sees since the test started: users, revenue and trials per arm."""
+    start = test["started_at"][:10] if test.get("started_at") else None
+    if not start:
+        return None
+    pid = test["placement"]["placement_id"]
+    try:
+        if test["type"] == "flow":
+            per_arm = {a["name"]: flow_live_metrics(a["content_id"], test["title"], start) for a in arms}
+            per_arm = {k: v for k, v in per_arm.items() if v}
+        else:  # paywall tests: revenue per paywall from the analytics API
+            res = adapty_cli.run("analytics", "chart", "--chart", "revenue", "--date-from", start,
+                                 "--date-to", date.today().isoformat(), "--group-by", "paywall_id",
+                                 "--filter", f"placement_id={pid}")
+            by_id = {s["key"]: s["value"] for s in res["data"]["segments"] if not s["is_total"]}
+            per_arm = {a["name"]: {"revenue": round(float(by_id.get(a["content_id"], 0.0)), 2)} for a in arms}
+    except (RuntimeError, KeyError, ValueError, TypeError):
+        return None
+    trials = sum(v.get("trials", 0) for v in per_arm.values())
+    finished = sum(v.get("trials_finished", 0) for v in per_arm.values())
+    return {"since": start, "arms": per_arm,
+            "revenue": {k: v.get("revenue", 0.0) for k, v in per_arm.items()},
+            "trials": trials, "trials_finished": finished,
+            "immature": trials > 0 and finished / trials < 0.5}
+
+
+def horizon_of(test: dict) -> int:
+    """Use the horizon the test owner wrote in the goal ("…60-day revenue…"), else the default."""
+    m = re.search(r"(\d{1,3})-day", test.get("goal") or "")
+    return int(m.group(1)) if m and 7 <= int(m.group(1)) <= 365 else HORIZON_DAYS
 
 
 def unsupported(base: dict, test: dict, why: str) -> dict:
@@ -188,18 +222,20 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     base = {"ab_test_id": test["ab_test_id"], "title": test["title"], "state": test["state"], "type": test["type"],
             "placement": test["placement"]["title"], "placement_id": test["placement"]["placement_id"],
             "placement_code": (placements or {}).get(test["placement"]["placement_id"]),
-            "segment_ids": test.get("segment_ids", []), "goal": test.get("goal"), "horizon_days": HORIZON_DAYS,
-            "arms_config": arms}
+            "segment_ids": test.get("segment_ids", []), "goal": test.get("goal"),
+            "horizon_days": horizon_of(test), "arms_config": arms}
     if test["state"] == "draft":
         return plan_draft(base, arms, u, code)
     if test["type"] != "flow":
         return unsupported(base, test, "paywall test: the offline history has flows only, so it can't be judged on "
                                        "matured revenue yet (an Adapty S3/BigQuery export would add it)")
-    if len(arms) != 2:
-        return unsupported(base, test, f"{len(arms)} arms: only two-arm tests are judged")
+    if len(arms) < 2:
+        return unsupported(base, test, "fewer than two arms")
     e_all = u[u.ab_test == test["title"]]
     if e_all.empty:
-        return unsupported(base, test, "no history for this test in the offline dataset")
+        return unsupported(base, test, "no user→arm history for this test (the offline dataset covers the seeded "
+                                       "Lumen app; in production this comes from an Adapty S3/BigQuery export)")
+    horizon = base["horizon_days"]
 
     e = e_all[e_all.matured]
     stats_by_arm = []
@@ -209,16 +245,18 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                              "payer_rate": round(float(s.payer.mean()), 4), "_ids": s.user_id})
     if min(a["users"] for a in stats_by_arm) < 100:
         return unsupported(base, test, "fewer than 100 matured users in an arm: too early to judge")
-    win, lose = sorted(stats_by_arm, key=lambda a: -a["rev_per_user"])
+    # with 3+ arms the winner is compared with the runner-up (the hardest comparison); money counts all others
+    ranked = sorted(stats_by_arm, key=lambda a: -a["rev_per_user"])
+    win, lose, others = ranked[0], ranked[1], ranked[2:]
     w_rev, l_rev = e[e.user_id.isin(win["_ids"])].revenue.values, e[e.user_id.isin(lose["_ids"])].revenue.values
     lo, hi, p = boot(w_rev, l_rev)
     gap = win["rev_per_user"] - lose["rev_per_user"]
 
     # health: SRM + randomization balance on the pre-exposure intent score (GrowthBook threshold p < 0.001)
-    w = np.array([win["weight"], lose["weight"]], dtype=float)
-    srm_p = float(stats.chisquare([win["users"], lose["users"]], w / w.sum() * (win["users"] + lose["users"])).pvalue)
-    bal_p = float(stats.ttest_ind(e[e.user_id.isin(win["_ids"])].intent_score,
-                                  e[e.user_id.isin(lose["_ids"])].intent_score, equal_var=False).pvalue)
+    w = np.array([a["weight"] for a in ranked], dtype=float)
+    users = np.array([a["users"] for a in ranked])
+    srm_p = float(stats.chisquare(users, w / w.sum() * users.sum()).pvalue)
+    bal_p = float(stats.f_oneway(*[e[e.user_id.isin(a["_ids"])].intent_score for a in ranked]).pvalue)
 
     # guardrails: the winner must not raise refunds or billing issues
     gw, gl = guardrails(t, win["_ids"]), guardrails(t, lose["_ids"])
@@ -234,7 +272,7 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     if abs(mw[1] - ml[1]) >= 0.25:
         fast, slow = (win, lose) if mw[1] > ml[1] else (lose, win)
         fm, sm = (mw, ml) if fast is win else (ml, mw)
-        early_bias = (f"By day 1, {fast['name']} has collected {fm[1]:.0%} of its 60-day revenue and "
+        early_bias = (f"By day 1, {fast['name']} has collected {fm[1]:.0%} of its {horizon}-day revenue and "
                       f"{slow['name']} {sm[1]:.0%}. A dashboard read in the first days favours {fast['name']}, "
                       f"whatever the final winner.")
 
@@ -254,10 +292,13 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     flipped = [s for s in segs if s["ci"][1] < 0]
     unclear = [s for s in segs if s["ci"][0] <= 0 <= s["ci"][1]]
 
-    # money: one month of new installs, each followed for 60 days
+    # money: one month of new installs on every non-winning arm, each followed for the horizon
     days = (e_all.install_at.max() - e_all.install_at.min()).days or 1
     daily_users = len(e_all) / days * (LIVE_USERS / OFFLINE_USERS)
-    lost_month = daily_users * 30 * (lose["weight"] / 100) * gap
+    total_w = float(w.sum())
+    lost_month = daily_users * 30 * sum(a["weight"] / total_w * (win["rev_per_user"] - a["rev_per_user"])
+                                        for a in ranked[1:])
+    losing_share = sum(a["weight"] for a in ranked[1:]) / total_w
 
     decided = lo > 0 and p > 0.99
     healthy = srm_p > 0.01 and bal_p > 0.001
@@ -276,7 +317,8 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
         verdict = "keep_running"
 
     reasons = [f"{win['name']} earns ${win['rev_per_user']:.2f} vs ${lose['rev_per_user']:.2f} per user in "
-               f"{HORIZON_DAYS}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%})",
+               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%})"
+               + (f"; {len(others)} more arm(s) further behind" if others else ""),
                f"traffic split {'OK' if srm_p > 0.01 else 'BROKEN'} (SRM p={srm_p:.2f}), groups "
                f"{'balanced' if bal_p > 0.001 else 'UNBALANCED'} on intent (p={bal_p:.2f})",
                "guardrails OK (refunds, billing issues)" if not guard_fail else
@@ -286,9 +328,10 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     if verdict == "keep_running":
         reasons.append(f"needs ≈{n_needed:,} matured users per arm to detect a {MDE:.0%} lift")
 
-    for a in (win, lose):
+    for a in ranked:
         a.pop("_ids")
-    return {**base, "matured_users": int(len(e)), "arms": [win, lose], "winner": win, "loser": lose,
+    return {**base, "matured_users": int(len(e)), "arms": ranked, "winner": win, "loser": lose, "others": others,
+            "losing_share": round(losing_share, 4),
             "lift_pct": round(100 * gap / lose["rev_per_user"], 1) if lose["rev_per_user"] else None,
             "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4),
             "health": {"srm_pvalue": round(srm_p, 4), "balance_pvalue": round(bal_p, 4), "healthy": healthy},
@@ -309,7 +352,7 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
     days = (pl.install_at.max() - pl.install_at.min()).days or 1 if not pl.empty else 1
     daily = len(pl) / days * (LIVE_USERS / OFFLINE_USERS) if not pl.empty else 0
     n = sample_size_per_arm(hist.revenue.values) if len(hist) > 30 else None
-    days_needed = int(np.ceil(n * len(arms) / daily)) + HORIZON_DAYS if n and daily else None
+    days_needed = int(np.ceil(n * len(arms) / daily)) + base["horizon_days"] if n and daily else None
     # smallest lift detectable with 30 days of enrolment at this traffic (n scales with 1/MDE^2)
     n30 = daily * 30 / len(arms)
     mde30 = MDE * np.sqrt(n / n30) if n and n30 else None
@@ -321,7 +364,7 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
             "reasons": [f"baseline ${hist.revenue.mean():.2f} per user at this placement ({len(hist):,} matured users)"
                         if len(hist) else "no history at this placement",
                         f"≈{n:,} users per arm to detect a {MDE:.0%} lift; at ≈{daily:.0f} users/day that is "
-                        f"≈{days_needed} days including the {HORIZON_DAYS}-day revenue window"
+                        f"≈{days_needed} days including the {base['horizon_days']}-day revenue window"
                         if days_needed else "traffic too low to size",
                         f"with 30 days of traffic it can only detect a lift of ≈{100 * mde30:.0f}% or more"
                         if mde30 else ""]}
@@ -334,32 +377,71 @@ def write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def build_report() -> dict:
-    u, t, end = load()
-    u = add_intent(u)
-    names, placements = flow_names(), placement_codes()
-    tests = adapty_cli.list_tests()
-    judged = [r for tst in tests if tst["state"] in ("live", "completed", "draft")
-              and (r := judge(tst, u, t, names, placements))]
-    m = u[u.matured]
-    bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
-    report = {
-        "schema": REPORT_SCHEMA, "app_id": adapty_cli.APP_ID, "data_end": str(end), "horizon_days": HORIZON_DAYS,
-        "segment_names": {s["id"]: s["title"] for s in adapty_cli.run("segments", "list")["data"]},
-        "tests": judged,
-        "total_lost_per_month_usd": round(sum(x.get("lost_per_month_usd", 0) for x in judged
-                                              if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2),
-        "intent": {
-            "payer_rate_by_ai_edits_day1": {str(k): round(float(v), 3)
-                                            for k, v in m.groupby(bins, observed=False).payer.mean().fillna(0).items()},
-            "rev_per_user_by_intent": {k: round(float(m[m.intent == k].revenue.mean() or 0), 2)
-                                       for k in ["low", "mid", "high"]},
-            "payer_rate_by_intent": {k: round(float(m[m.intent == k].payer.mean() or 0), 3)
-                                     for k in ["low", "mid", "high"]}},
-    }
+def report_path(app_id: str | None = None) -> Path:
+    """out/report.json for the default app, out/report-<app>.json for any other app of the portfolio."""
+    app_id = app_id or adapty_cli.DEFAULT_APP_ID
+    return OUT / ("report.json" if app_id == adapty_cli.DEFAULT_APP_ID else f"report-{app_id}.json")
+
+
+def build_report(app_id: str | None = None) -> dict:
+    app_id = app_id or adapty_cli.DEFAULT_APP_ID
+    with adapty_cli.use_app(app_id):
+        has_history = app_id == OFFLINE_APP_ID  # the offline user→arm history belongs to the seeded Lumen app
+        datasets: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
+        base_u, base_t, end = load(HORIZON_DAYS)
+        base_u = add_intent(base_u)
+        if not has_history:
+            base_u = base_u.iloc[0:0]
+        datasets[HORIZON_DAYS] = (base_u, base_t)
+
+        def data_for(h: int):
+            if h not in datasets:  # another horizon: recompute revenue, keep the same intent scores
+                u_h, t_h, _ = load(h)
+                u_h = u_h.merge(base_u[["user_id", "intent_score", "intent"]], on="user_id")
+                datasets[h] = (u_h, t_h)
+            return datasets[h]
+
+        names, placements = flow_names(), placement_codes()
+        judged = []
+        for tst in adapty_cli.list_tests():
+            if tst["state"] in ("live", "completed", "draft"):
+                u, t = data_for(horizon_of(tst))
+                if (res := judge(tst, u, t, names, placements)) is not None:
+                    judged.append(res)
+        m = base_u[base_u.matured]
+        bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
+        report = {
+            "schema": REPORT_SCHEMA, "app_id": app_id, "has_history": has_history, "data_end": str(end),
+            "horizon_days": HORIZON_DAYS,
+            "segment_names": {s["id"]: s["title"] for s in adapty_cli.run("segments", "list")["data"]},
+            "tests": judged,
+            "total_lost_per_month_usd": round(sum(x.get("lost_per_month_usd", 0) for x in judged
+                                                  if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2),
+            "intent": None if m.empty else {
+                "payer_rate_by_ai_edits_day1": {str(k): round(float(v), 3) for k, v in
+                                                m.groupby(bins, observed=False).payer.mean().fillna(0).items()},
+                "rev_per_user_by_intent": {k: round(float(m[m.intent == k].revenue.mean() or 0), 2)
+                                           for k in ["low", "mid", "high"]},
+                "payer_rate_by_intent": {k: round(float(m[m.intent == k].payer.mean() or 0), 3)
+                                         for k in ["low", "mid", "high"]}},
+        }
     OUT.mkdir(exist_ok=True)
-    write_atomic(OUT / "report.json", json.dumps(report, indent=2))
+    write_atomic(report_path(app_id), json.dumps(report, indent=2))
     return report
+
+
+def portfolio() -> list[dict]:
+    """One row per app the Adapty account can open: tests, decided live tests, money at stake."""
+    rows = []
+    for app in adapty_cli.list_apps():
+        r = build_report(app["id"])
+        live = [t for t in r["tests"] if t["state"] == "live"]
+        rows.append({"app_id": app["id"], "app": app["title"], "tests": len(r["tests"]), "live": len(live),
+                     "decided_live": sum(t["verdict"] == "stop_and_roll_out" for t in live),
+                     "lost_per_month_usd": r["total_lost_per_month_usd"], "has_history": r["has_history"]})
+    OUT.mkdir(exist_ok=True)
+    write_atomic(OUT / "portfolio.json", json.dumps(rows, indent=2))
+    return rows
 
 
 if __name__ == "__main__":
