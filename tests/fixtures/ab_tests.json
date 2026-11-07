@@ -1,0 +1,132 @@
+[
+ {
+  "ab_test_id": "83f16053-4767-4251-b736-ce9bb4d6897e",
+  "title": "Main: 3 plans vs lifetime anchor (NA)",
+  "type": "flow",
+  "state": "live",
+  "placement": {
+   "placement_id": "8248e36e-e5b1-480e-8019-fa0a1fd9ab41",
+   "title": "Main paywall"
+  },
+  "segment_ids": [
+   "8393d03d-88b1-40ce-8b2d-ee18b84060f9"
+  ],
+  "priority": 0,
+  "started_at": "2026-11-06T20:51:47.072038Z",
+  "stopped_at": null,
+  "goal": "Does a lifetime anchor lift annual share in North America?",
+  "paywalls": [],
+  "flows": [
+   {
+    "flow_id": "1f462a25-9a31-4234-ab06-14ede616b78f",
+    "flow_name": "Main - 3 plans",
+    "weight": 50,
+    "title": "A",
+    "variation_id": "11577afd-6374-4eb1-9e5a-fea77a8f16ed"
+   },
+   {
+    "flow_id": "1c555556-b30b-4011-ab89-3eec60f9a59d",
+    "flow_name": "Main - Lifetime anchor",
+    "weight": 50,
+    "title": "B",
+    "variation_id": "876775e6-98c7-4288-8848-9d692e7b629c"
+   }
+  ]
+ },
+ {
+  "ab_test_id": "92f60d8a-7442-42ca-bb77-2a1af8d49df2",
+  "title": "Onboarding: annual trial vs weekly first",
+  "type": "flow",
+  "state": "live",
+  "placement": {
+   "placement_id": "01e6efce-6a36-4835-a494-731adf727209",
+   "title": "Onboarding"
+  },
+  "segment_ids": [],
+  "priority": 0,
+  "started_at": "2026-11-06T20:51:45.942711Z",
+  "stopped_at": null,
+  "goal": "Find which onboarding offer maximises 60-day revenue per install",
+  "paywalls": [],
+  "flows": [
+   {
+    "flow_id": "db00b920-9863-4635-b174-17fde357f3c2",
+    "flow_name": "Onboarding - Annual trial",
+    "weight": 50,
+    "title": "A",
+    "variation_id": "63611342-6a0b-4403-8237-13c8d4f70a35"
+   },
+   {
+    "flow_id": "2b952e20-7263-4b08-8d67-010fce674454",
+    "flow_name": "Onboarding - Weekly first",
+    "weight": 50,
+    "title": "B",
+    "variation_id": "08524883-078f-44f0-8716-d8fd1ea9db7e"
+   }
+  ]
+ },
+ {
+  "ab_test_id": "2e96b431-4a11-4ac0-b104-b2152951484c",
+  "title": "AI limit: Pro vs 3 plans",
+  "type": "flow",
+  "state": "draft",
+  "placement": {
+   "placement_id": "6d7017c6-6621-4de5-80ed-5c50b97a1960",
+   "title": "AI edits limit reached"
+  },
+  "segment_ids": [],
+  "priority": 0,
+  "started_at": null,
+  "stopped_at": null,
+  "goal": "Draft - planned for next sprint",
+  "paywalls": [],
+  "flows": [
+   {
+    "flow_id": "3f533b92-6ef0-4bff-884f-65333fd6e809",
+    "flow_name": "AI limit reached - Pro",
+    "weight": 50,
+    "title": "A",
+    "variation_id": "effe2a9f-1ea7-4e78-ba35-d498ee3bfdf5"
+   },
+   {
+    "flow_id": "1f462a25-9a31-4234-ab06-14ede616b78f",
+    "flow_name": "Main - 3 plans",
+    "weight": 50,
+    "title": "B",
+    "variation_id": "fccea1d0-1887-435d-bd1d-661396446580"
+   }
+  ]
+ },
+ {
+  "ab_test_id": "1b9ba3a4-e3a0-49b7-b7e7-70cd09fead40",
+  "title": "Settings: upgrade vs lifetime anchor",
+  "type": "flow",
+  "state": "completed",
+  "placement": {
+   "placement_id": "203f6608-c9db-457c-bfbe-15572dc55371",
+   "title": "Settings - Upgrade"
+  },
+  "segment_ids": [],
+  "priority": 0,
+  "started_at": "2026-11-06T20:51:48.159145Z",
+  "stopped_at": "2026-11-06T20:51:48.866773Z",
+  "goal": "Earlier test - stopped with a winner",
+  "paywalls": [],
+  "flows": [
+   {
+    "flow_id": "535cf862-3449-4d3e-a653-a685bf47c74b",
+    "flow_name": "Settings - Upgrade",
+    "weight": 50,
+    "title": "A",
+    "variation_id": "08aeca4a-4eab-46c3-a7cc-ff0a28a60c3f"
+   },
+   {
+    "flow_id": "1c555556-b30b-4011-ab89-3eec60f9a59d",
+    "flow_name": "Main - Lifetime anchor",
+    "weight": 50,
+    "title": "B",
+    "variation_id": "33da56e5-6899-499a-a21e-1f7601de21b0"
+   }
+  ]
+ }
+]
