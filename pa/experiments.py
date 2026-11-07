@@ -50,10 +50,12 @@ def flow_names() -> dict[str, str]:
     return {**FALLBACK_FLOW_NAMES, **found}  # a flow the regex misses still maps
 
 
-REPORT_SCHEMA = 4  # bump when the report's keys change; readers rebuild older reports
-# apps seeded from the offline dataset (comma-separated), e.g. the demo app and a rehearsal copy
-OFFLINE_APP_IDS = {a.strip() for a in os.getenv("OFFLINE_APP_IDS", os.getenv(
-    "OFFLINE_APP_ID", "f414265a-e67a-41ce-85b1-c4c1d02c3816")).split(",") if a.strip()}
+REPORT_SCHEMA = 5  # bump when the report's keys change; readers rebuild older reports
+def history_apps() -> set[str]:
+    """Apps seeded from the offline dataset: the default app always, plus OFFLINE_APP_IDS (comma-separated),
+    e.g. a rehearsal copy. Read at call time so a changed environment takes effect."""
+    extra = os.getenv("OFFLINE_APP_IDS", os.getenv("OFFLINE_APP_ID", ""))
+    return {adapty_cli.DEFAULT_APP_ID, *(a.strip() for a in extra.split(",") if a.strip())}
 
 
 def placement_codes() -> dict[str, str]:
@@ -120,11 +122,29 @@ def arms_of(test: dict) -> list[dict]:
              "weight": a["weight"]} for a in test.get("paywalls", [])]
 
 
-def maturity(t: pd.DataFrame, users: pd.Series) -> dict:
-    """Share of each user group's 60-day revenue already collected by day d."""
+def maturity(t: pd.DataFrame, users: pd.Series, horizon: int = HORIZON_DAYS) -> dict:
+    """Share of each user group's horizon revenue already collected by day d (d = 1, 7, 30, … up to the horizon)."""
     tx = t[t.user_id.isin(users) & t.paid & t.refunded_at.isna()]
     total = tx.price_usd.sum()
-    return {d: round(float(tx[tx.day <= d].price_usd.sum() / total), 3) if total else 0.0 for d in MATURITY_DAYS}
+    days = sorted({d for d in MATURITY_DAYS if d < horizon} | {horizon})
+    return {d: round(float(tx[tx.day <= d].price_usd.sum() / total), 3) if total else 0.0 for d in days}
+
+
+def current_mrr() -> float | None:
+    """Today's MRR from Adapty analytics, to put the headline in proportion (None if unavailable)."""
+    try:
+        today = date.today()
+        res = adapty_cli.run("analytics", "chart", "--chart", "mrr", "--date-from",
+                             (today - pd.Timedelta(days=7)).isoformat(), "--date-to", today.isoformat())
+        return round(float(res["data"]["value"]), 2) or None
+    except (RuntimeError, KeyError, ValueError, TypeError):
+        return None
+
+
+def decided_total(tests: list[dict]) -> float:
+    """Money lost per month on live tests whose verdict is stop_and_roll_out: the one definition of the headline."""
+    return round(sum(x.get("lost_per_month_usd", 0) for x in tests
+                     if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2)
 
 
 def rate_p_by_user(t: pd.DataFrame, a_users: pd.Series, b_users: pd.Series, event: str, n: int = 2000) -> float:
@@ -157,21 +177,21 @@ def guardrails(t: pd.DataFrame, users: pd.Series) -> dict:
             "billing_issue_rate": round(float(tx.billing_issue_detected_at.notna().mean()), 4) if n else 0.0}
 
 
-def _find(node: dict, level: str, title: str) -> dict | None:
-    if node.get("level") == level and node.get("title") == title:
-        return node
+def _find_all(node: dict, level: str, title: str) -> list[dict]:
+    hits = [node] if node.get("level") == level and node.get("title") == title else []
     for child in node.get("items", []):
-        if (hit := _find(child, level, title)) is not None:
-            return hit
-    return None
+        hits += _find_all(child, level, title)
+    return hits
 
 
-def flow_live_metrics(flow_id: str, test_title: str, start: str) -> dict | None:
+def flow_live_metrics(flow_id: str, test_title: str, start: str, test_id: str | None = None) -> dict | None:
     """One arm as the Adapty flow metrics page shows it, counting ONLY users inside this A/B test: the same flow can
-    also be shown outside the test (e.g. to other audiences at the same placement)."""
+    also be shown outside the test (e.g. to other audiences at the same placement). Titles aren't unique (a copied
+    test keeps its title), so a node carrying this test's id wins; otherwise the last matching node."""
     res = adapty_cli.run("flows", "metrics", "get", flow_id, "--date-type", "profile_install_date",
                          "--based-on", "audience", "--date-from", start, "--date-to", date.today().isoformat())
-    item = _find(res["data"], "ab_test", test_title)
+    hits = _find_all(res["data"], "ab_test", test_title)
+    item = next((h for h in hits if test_id and h.get("ab_test_id") == test_id), hits[-1] if hits else None)
     if item is None:
         return None
     users = int(item.get("unique_profiles_views") or 0)
@@ -189,7 +209,8 @@ def live_view(test: dict, arms: list[dict]) -> dict | None:
     pid = test["placement"]["placement_id"]
     try:
         if test["type"] == "flow":
-            per_arm = {a["name"]: flow_live_metrics(a["content_id"], test["title"], start) for a in arms}
+            per_arm = {a["name"]: flow_live_metrics(a["content_id"], test["title"], start, test.get("ab_test_id"))
+                       for a in arms}
             per_arm = {k: v for k, v in per_arm.items() if v}
         else:  # paywall tests: revenue per paywall from the analytics API
             res = adapty_cli.run("analytics", "chart", "--chart", "revenue", "--date-from", start,
@@ -198,6 +219,8 @@ def live_view(test: dict, arms: list[dict]) -> dict | None:
             by_id = {s["key"]: s["value"] for s in res["data"]["segments"] if not s["is_total"]}
             per_arm = {a["name"]: {"revenue": round(float(by_id.get(a["content_id"], 0.0)), 2)} for a in arms}
     except (RuntimeError, KeyError, ValueError, TypeError):
+        return None
+    if not per_arm:  # no arm found in Adapty's metrics: say "no live data", not an empty line
         return None
     trials = sum(v.get("trials", 0) for v in per_arm.values())
     finished = sum(v.get("trials_finished", 0) for v in per_arm.values())
@@ -209,7 +232,8 @@ def live_view(test: dict, arms: list[dict]) -> dict | None:
 
 def horizon_of(test: dict) -> int:
     """Use the horizon the test owner wrote in the goal ("…60-day revenue…"), else the default."""
-    m = re.search(r"(\d{1,3})-day", test.get("goal") or "")
+    # only "N-day revenue" counts: "7-day trial" is a product detail, not the horizon
+    m = re.search(r"(\d{1,3})[- ]day\s+(?:net\s+|gross\s+)?revenue", test.get("goal") or "", re.I)
     return int(m.group(1)) if m and 7 <= int(m.group(1)) <= 365 else HORIZON_DAYS
 
 
@@ -269,7 +293,7 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
         ("billing-issue rate", billing_p, gw["billing_issue_rate"] > gl["billing_issue_rate"])] if worse and pv < 0.05]
 
     # metric maturity: early comparisons favour the arm that collects its revenue sooner
-    mw, ml = maturity(t, win["_ids"]), maturity(t, lose["_ids"])
+    mw, ml = maturity(t, win["_ids"], horizon), maturity(t, lose["_ids"], horizon)
     early_bias = None
     if abs(mw[1] - ml[1]) >= 0.25:
         fast, slow = (win, lose) if mw[1] > ml[1] else (lose, win)
@@ -388,12 +412,13 @@ def report_path(app_id: str | None = None) -> Path:
 def build_report(app_id: str | None = None) -> dict:
     app_id = app_id or adapty_cli.DEFAULT_APP_ID
     with adapty_cli.use_app(app_id):
-        has_history = app_id in OFFLINE_APP_IDS  # the offline user→arm history belongs to the seeded app(s)
+        has_history = app_id in history_apps()  # the offline user→arm history belongs to the seeded app(s)
         datasets: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
         base_u, base_t, end = load(HORIZON_DAYS)
-        base_u = add_intent(base_u)
-        if not has_history:
-            base_u = base_u.iloc[0:0]
+        if has_history:
+            base_u = add_intent(base_u)
+        else:  # no history for this app: skip the model, keep the columns judges expect
+            base_u = base_u.iloc[0:0].assign(intent_score=pd.Series(dtype=float), intent=pd.Series(dtype=str))
         datasets[HORIZON_DAYS] = (base_u, base_t)
 
         def data_for(h: int):
@@ -409,7 +434,8 @@ def build_report(app_id: str | None = None) -> dict:
             data_for(horizon_of(tst))
         from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
         with ThreadPoolExecutor(max_workers=4) as pool:  # judges wait on Adapty CLI calls (live view)
-            results = list(pool.map(lambda x: judge(x, *data_for(horizon_of(x)), names, placements), tests))
+            results = list(pool.map(adapty_cli.in_current_app(
+                lambda x: judge(x, *data_for(horizon_of(x)), names, placements)), tests))
         judged = [res for res in results if res is not None]
         m = base_u[base_u.matured]
         bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
@@ -418,8 +444,8 @@ def build_report(app_id: str | None = None) -> dict:
             "horizon_days": HORIZON_DAYS,
             "segment_names": {s["id"]: s["title"] for s in adapty_cli.run("segments", "list")["data"]},
             "tests": judged,
-            "total_lost_per_month_usd": round(sum(x.get("lost_per_month_usd", 0) for x in judged
-                                                  if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2),
+            "total_lost_per_month_usd": decided_total(judged),
+            "mrr_usd": current_mrr(),
             "intent": None if m.empty else {
                 "payer_rate_by_ai_edits_day1": {str(k): round(float(v), 3) for k, v in
                                                 m.groupby(bins, observed=False).payer.mean().fillna(0).items()},
@@ -440,8 +466,7 @@ def mark_stopped(app_id: str, test_id: str) -> dict:
     for t in r["tests"]:
         if t["ab_test_id"] == test_id:
             t["state"], t["verdict"] = "completed", "completed_confirmed"
-    r["total_lost_per_month_usd"] = round(sum(x.get("lost_per_month_usd", 0) for x in r["tests"]
-                                              if x["state"] == "live" and x["verdict"] == "stop_and_roll_out"), 2)
+    r["total_lost_per_month_usd"] = decided_total(r["tests"])
     write_atomic(path, json.dumps(r, indent=2))
     return r
 

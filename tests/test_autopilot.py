@@ -37,10 +37,12 @@ def fake_run(*args):
 
 @pytest.fixture
 def mocked(monkeypatch, tmp_path):
-    state = {"tests": copy.deepcopy(TESTS), "stopped": []}
+    state = {"tests": copy.deepcopy(TESTS), "stopped": [], "apps": []}
     monkeypatch.setattr(adapty_cli, "list_tests", lambda: copy.deepcopy(state["tests"]))
     monkeypatch.setattr(adapty_cli, "run", fake_run)
-    monkeypatch.setattr(adapty_cli, "stop_test", lambda tid, wid: state["stopped"].append((tid, wid)) or {"ok": True})
+    monkeypatch.setattr(adapty_cli, "stop_test",
+                        lambda tid, wid, app_id=None: state["stopped"].append((tid, wid)) or state["apps"].append(app_id)
+                        or {"ok": True})
     monkeypatch.chdir(tmp_path)
     return state
 
@@ -115,6 +117,7 @@ def test_stop_calls_adapty_with_winner_and_writes_audit(mocked, monkeypatch):
                                      "--approved-by", "tester"])
     cli.main()
     assert mocked["stopped"] == [(main_test["ab_test_id"], winner)]
+    assert mocked["apps"] == [adapty_cli.DEFAULT_APP_ID]  # the app is passed explicitly, not via a global
     entry = json.loads(Path("out/audit.log").read_text().splitlines()[-1])
     assert entry["approved_by"] == "tester" and entry["winner"] == "Main - Lifetime anchor"
 
@@ -223,3 +226,108 @@ def test_mark_stopped_updates_card_and_money_without_rebuilding(mocked):
     r = experiments.mark_stopped(adapty_cli.DEFAULT_APP_ID, onb_id)
     assert by_title(r)[ONB]["verdict"] == "completed_confirmed"
     assert r["total_lost_per_month_usd"] == pytest.approx(353.63, abs=1)
+
+
+# ---------------------------------------------------------------- review round 4 (written before the fixes)
+def test_concurrent_sessions_keep_their_own_app(monkeypatch):
+    """Streamlit runs each browser session in a thread of one process: one session's app must not leak."""
+    import threading
+    import time as _t
+    seen = {}
+    monkeypatch.setattr(adapty_cli, "_exec", lambda args: {"app": args[args.index("--app") + 1]})
+
+    def session(app, delay):
+        with adapty_cli.use_app(app):
+            _t.sleep(delay)
+            seen[app] = adapty_cli.run("ab-tests", "list")["app"]
+    a = threading.Thread(target=session, args=("app-A", 0.05))  # A leaves while B is still working
+    b = threading.Thread(target=session, args=("app-B", 0.2))
+    a.start(); _t.sleep(0.02); b.start(); a.join(); b.join()
+    assert seen == {"app-A": "app-A", "app-B": "app-B"}
+
+
+def test_worker_threads_inherit_the_session_app(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(adapty_cli, "_exec", lambda args: {"app": args[args.index("--app") + 1]})
+    with adapty_cli.use_app("app-W"):
+        with ThreadPoolExecutor(2) as pool:
+            got = list(pool.map(adapty_cli.in_current_app(lambda _: adapty_cli.run("x")["app"]), range(3)))
+    assert got == ["app-W"] * 3
+
+
+def test_horizon_ignores_trial_lengths():
+    assert experiments.horizon_of({"goal": "Annual with 7-day trial vs weekly: which earns more per install?"}) == 60
+    assert experiments.horizon_of({"goal": "Find which offer maximises 30-day revenue per install"}) == 30
+
+
+def test_default_app_always_has_its_history(monkeypatch):
+    monkeypatch.setenv("OFFLINE_APP_IDS", "some-other-app")
+    assert adapty_cli.DEFAULT_APP_ID in experiments.history_apps()
+
+
+def test_live_metrics_prefer_the_node_with_the_test_id(monkeypatch):
+    tree = {"data": {"items": [
+        {"level": "ab_test", "title": MAIN, "ab_test_id": "old", "unique_profiles_views": 900, "revenue": 1.0},
+        {"level": "ab_test", "title": MAIN, "ab_test_id": "new", "unique_profiles_views": 40, "revenue": 63.0}]}}
+    monkeypatch.setattr(adapty_cli, "run", lambda *a: tree)
+    assert experiments.flow_live_metrics("f", MAIN, "2026-11-06", test_id="new")["users"] == 40
+
+
+def test_empty_live_view_is_none(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", lambda *a: {"data": {"items": []}})
+    test = {"title": MAIN, "type": "flow", "started_at": "2026-11-06T00:00:00Z", "ab_test_id": "x",
+            "placement": {"placement_id": "p", "title": "P"}}
+    assert experiments.live_view(test, [{"name": "A", "content_id": "a"}]) is None
+
+
+def test_digest_names_the_app_and_uses_live_immaturity(mocked):
+    from pa import notify
+    r = experiments.build_report()
+    for t in r["tests"]:
+        if t["title"] == MAIN:
+            t["live_view"] = {"trials": 10, "trials_finished": 1, "immature": True, "arms": {}}
+    text = json.dumps(notify.digest(r, "Lumen BACKUP"))
+    assert "Lumen BACKUP" in text and "1 of 10 trials" in text
+
+
+def test_notify_rebuilds_and_titles_the_digest_with_the_app_name(mocked, monkeypatch):
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen MAIN"}])
+    Path("out").mkdir()
+    stale = {"schema": experiments.REPORT_SCHEMA, "app_id": adapty_cli.DEFAULT_APP_ID, "tests": [],
+             "total_lost_per_month_usd": 0}
+    Path("out/report.json").write_text(json.dumps(stale))  # days-old report on disk
+    monkeypatch.setattr("sys.argv", ["pa.cli", "notify"])
+    cli.main()
+    msg = Path("out/slack_message.json").read_text()
+    assert "Lumen MAIN" in msg and "2 live test(s) are decided" in msg
+
+
+def test_maturity_days_follow_the_test_horizon(data):
+    u, _ = data
+    _, t30, _ = experiments.load(30)
+    m = experiments.maturity(t30, u.user_id.head(2000), horizon=30)
+    assert max(m) == 30 and m[30] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_money_total_has_one_definition(mocked):
+    r = experiments.build_report()
+    assert experiments.decided_total(r["tests"]) == r["total_lost_per_month_usd"]
+
+
+def test_throttled_cli_calls_are_retried_after_the_wait_adapty_asks_for(monkeypatch):
+    import subprocess as sp
+    calls, waits = [], []
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return sp.CompletedProcess(cmd, 1, "", '{"error": {"message": "Request was throttled. Expected available in 1 second."}}')
+        return sp.CompletedProcess(cmd, 0, '{"data": []}', "")
+    monkeypatch.setattr(adapty_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(adapty_cli.time, "sleep", lambda s: waits.append(s))
+    assert adapty_cli.run("ab-tests", "list") == {"data": []}
+    assert len(calls) == 2 and waits and waits[0] >= 1
+
+
+def test_cli_concurrency_is_capped():
+    assert adapty_cli.MAX_CONCURRENT_CALLS <= 3

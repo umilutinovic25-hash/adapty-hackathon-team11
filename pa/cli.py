@@ -58,8 +58,7 @@ def plan(r: dict, test_id: str) -> dict:
     names = r.get("segment_names", {})
     audience = ", ".join(names.get(s, s) for s in t["segment_ids"]) or "all users"
     losers = ", ".join(a["name"] for a in t["arms"][1:])
-    with adapty_cli.use_app(r["app_id"]):
-        command = " ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"]))
+    command = " ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"], app_id=r["app_id"]))
     return {"app_id": r["app_id"], "test": t["title"], "placement": t["placement"], "audience": audience,
             "winner": t["winner"]["name"], "winner_id": t["winner"]["content_id"],
             "affected": f"{t['losing_share']:.0%} now on {losers} "
@@ -95,8 +94,7 @@ def main() -> None:
         if pln["winner_id"] != a.winner_id:
             sys.exit(f"refusing: fresh data picks {pln['winner']} ({pln['winner_id']}), not the approved winner "
                      f"{a.winner_id}. Run `plan` again and get a new approval.")
-        with adapty_cli.use_app(pln["app_id"]):
-            res = adapty_cli.stop_test(a.test_id, pln["winner_id"])
+        res = adapty_cli.stop_test(a.test_id, pln["winner_id"], app_id=pln["app_id"])
         AUDIT.parent.mkdir(exist_ok=True)
         with AUDIT.open("a") as f:
             f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "approved_by": a.approved_by,
@@ -108,8 +106,10 @@ def main() -> None:
         for row in rows:
             print(f"| {row['app']} | {row['tests']} | {row['live']} | {row['decided_live']} | "
                   f"${row['lost_per_month_usd']:,.0f} | {'yes' if row['has_history'] else 'live only'} |")
-    elif a.cmd == "notify":
-        print(json.dumps(notify.send(report(fresh=False, app_id=a.app)), indent=2))
+    elif a.cmd == "notify":  # meant for a daily cron: always judge on fresh Adapty data
+        r = report(fresh=True, app_id=a.app)
+        title = next((x["title"] for x in adapty_cli.list_apps() if x["id"] == r["app_id"]), r["app_id"])
+        print(json.dumps(notify.send(r, title), indent=2))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@ DASHBOARD_URL = os.getenv("AUTOPILOT_DASHBOARD_URL", "http://localhost:8501")
 OUT = Path("out/slack_message.json")
 
 
-def digest(report: dict, app_title: str = "Lumen") -> dict:
+def digest(report: dict, app_title: str | None = None) -> dict:
+    app_title = app_title or report.get("app_id", "Adapty app")
     decided = [t for t in report["tests"] if t["state"] == "live" and t["verdict"] == "stop_and_roll_out"]
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"🧪 Experiment Autopilot · {app_title}"}}]
     if not decided:
@@ -25,18 +26,26 @@ def digest(report: dict, app_title: str = "Lumen") -> dict:
                        f"*{len(decided)} live test(s) are decided*, costing *${report['total_lost_per_month_usd']:,.0f}"
                        f"/month* on losing arms."}})
         for t in decided:
-            warn = "\n⏱️ _Adapty's early read is immature for this test._" if t["maturity"].get("early_bias") else ""
+            lv = t.get("live_view") or {}
+            if lv.get("immature"):
+                warn = (f"\n⏱️ _Adapty's own numbers are immature: {lv['trials_finished']} of {lv['trials']} trials "
+                        f"in this test have finished._")
+            elif t["maturity"].get("early_bias"):
+                warn = "\n⏱️ _Early reads of this test favour the arm that charges first._"
+            else:
+                warn = ""
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
                            f"*{t['title']}* · {t['placement']}\n🏆 {t['winner']['name']} "
                            f"+{t['lift_pct']}% {t['horizon_days']}-day revenue/user "
                            f"(P {t['p_winner_better']:.0%}) · ${t['lost_per_month_usd']:,.0f}/month{warn}"}})
         blocks.append({"type": "actions", "elements": [{"type": "button", "style": "primary",
-                       "text": {"type": "plain_text", "text": "Review & approve"}, "url": DASHBOARD_URL}]})
+                       "text": {"type": "plain_text", "text": "Review & approve"},
+                       "url": f"{DASHBOARD_URL}?app={report['app_id']}"}]})
     text = f"{len(decided)} decided Adapty test(s), ${report['total_lost_per_month_usd']:,.0f}/month at stake"
     return {"text": text, "blocks": blocks}
 
 
-def send(report: dict, app_title: str = "Lumen") -> dict:
+def send(report: dict, app_title: str | None = None) -> dict:
     msg = digest(report, app_title)
     OUT.parent.mkdir(exist_ok=True)
     OUT.write_text(json.dumps(msg, indent=2))
