@@ -2,6 +2,19 @@
 
 **Adapty Hackathon Belgrade, 7–8 Nov 2026 · Team 11**
 
+![Experiment Autopilot dashboard on the Lumen demo app](docs/dashboard.jpg)
+
+### Result in 30 seconds
+
+- Lumen keeps **two decided A/B tests** at 50/50. Judged on matured 60-day revenue, they cost **≈$1,749/month**,
+  about 28% of today's MRR ($6,351, read from Adapty).
+- Adapty's own numbers are early. In the onboarding test, **0 of 138 trials have finished**, so the annual-trial arm
+  shows $0.
+- A completed test was **not significant** on the full history, and a draft would need **≈1,545 days** at this
+  traffic.
+- One approved click stops a decided test in Adapty: the plan is re-checked on fresh data and written to an audit log.
+  [See the full stop flow (GIF)](docs/stop-flow.gif), recorded on a rehearsal copy of the app.
+
 Adapty's A/B page judges a test from the day it starts. Early on, part of the revenue hasn't happened yet: an
 annual plan with a 7-day trial pays nothing in week one, a weekly plan pays on day one. Experiment Autopilot judges
 every Adapty test on **matured 60-day revenue over the full history**. It runs the health checks of experimentation
