@@ -22,7 +22,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-DATA_DIR = os.getenv("OFFLINE_DATA_DIR", "../hackaton_adapty/adapty-seed-data-hack/data/offline")
+from pa import project_path  # noqa: E402
+
+DATA_DIR = project_path(os.getenv("OFFLINE_DATA_DIR", "../hackaton_adapty/adapty-seed-data-hack/data/offline"))
 HORIZON_DAYS = 14
 ONB_TEST = "Onboarding: annual trial vs weekly first"
 CAT = ["platform", "country", "acquisition_channel", "onboarding_goal", "push_opt_in", "app_version"]
