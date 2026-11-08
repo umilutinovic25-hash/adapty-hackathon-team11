@@ -49,7 +49,7 @@ def flow_names() -> dict[str, str]:
     return {**FALLBACK_FLOW_NAMES, **found}  # a flow the regex misses still maps
 
 
-REPORT_SCHEMA = 5  # bump when the report's keys change; readers rebuild older reports
+REPORT_SCHEMA = 6  # bump when the report's keys change; readers rebuild older reports
 def history_apps() -> set[str]:
     """Apps seeded from the offline dataset: the default app always, plus OFFLINE_APP_IDS (comma-separated),
     e.g. a rehearsal copy. Read at call time so a changed environment takes effect."""
@@ -321,12 +321,10 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                              "payer_rate": round(float(s.payer.mean()), 4), "_ids": s.user_id})
     if min(a["users"] for a in stats_by_arm) < 100:
         return unsupported(base, test, "fewer than 100 matured users in an arm: too early to judge")
-    # with 3+ arms the winner is compared with the runner-up (the hardest comparison); money counts all others
+    # Keep the runner-up in the compact view, but verify every losing arm independently.
     ranked = sorted(stats_by_arm, key=lambda a: -a["rev_per_user"])
     win, lose, others = ranked[0], ranked[1], ranked[2:]
     w_rev, l_rev = e[e.user_id.isin(win["_ids"])].revenue.values, e[e.user_id.isin(lose["_ids"])].revenue.values
-    lo, hi, p = boot(w_rev, l_rev)
-    seq_p = always_valid_p(w_rev, l_rev)  # valid under the daily re-checks of the dashboard and cron
     gap = win["rev_per_user"] - lose["rev_per_user"]
 
     # health: SRM + randomization balance on the pre-exposure intent score (GrowthBook threshold p < 0.001)
@@ -339,13 +337,53 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
              if on.sum() >= 2 else 1.0)
     bal_p = float(stats.f_oneway(*[e[e.user_id.isin(a["_ids"])].intent_score for a in ranked]).pvalue)
 
-    # guardrails: the winner must not raise refunds or billing issues
-    gw, gl = guardrails(t, win["_ids"]), guardrails(t, lose["_ids"])
-    refund_p = rate_p_by_user(t, win["_ids"], lose["_ids"], "refunded_at")
-    billing_p = rate_p_by_user(t, win["_ids"], lose["_ids"], "billing_issue_detected_at")
-    guard_fail = [(n, pv) for n, pv, worse in [
-        ("refund rate", refund_p, gw["refund_rate"] > gl["refund_rate"]),
-        ("billing-issue rate", billing_p, gw["billing_issue_rate"] > gl["billing_issue_rate"])] if worse and pv < 0.05]
+    comparisons = []
+    for other in ranked[1:]:
+        other_rev = e[e.user_id.isin(other["_ids"])].revenue.values
+        clo, chi, cp = boot(w_rev, other_rev)
+        cseq = always_valid_p(w_rev, other_rev)
+        if other is lose:
+            lo, hi, p, seq_p = clo, chi, cp, cseq
+        # guardrails: the winner must not raise refunds or billing issues
+        gw, gl = guardrails(t, win["_ids"]), guardrails(t, other["_ids"])
+        refund_p = rate_p_by_user(t, win["_ids"], other["_ids"], "refunded_at")
+        billing_p = rate_p_by_user(t, win["_ids"], other["_ids"], "billing_issue_detected_at")
+        guard_fail = [(n, pv) for n, pv, worse in [
+            ("refund rate", refund_p, gw["refund_rate"] > gl["refund_rate"]),
+            ("billing-issue rate", billing_p, gw["billing_issue_rate"] > gl["billing_issue_rate"])] if worse and pv < 0.05]
+
+        # segment consistency, Bonferroni-corrected
+        segs = []
+        groups = [(col, val, g) for col in ["intent", "platform", "acquisition_channel"] for val, g in e.groupby(col)]
+        k = max(1, sum(1 for *_, g in groups if min(g.user_id.isin(win["_ids"]).sum(), g.user_id.isin(other["_ids"]).sum()) >= 80))
+        for col, val, g in groups:
+            a = g[g.user_id.isin(win["_ids"])].revenue.values
+            b = g[g.user_id.isin(other["_ids"])].revenue.values
+            if min(a.size, b.size) < 80:
+                continue
+            slo, shi, sp = boot(a, b, 1000, alpha=0.05 / k)
+            segs.append({"dimension": col, "value": str(val), "users": int(a.size + b.size),
+                         "winner_rpu": round(float(a.mean()), 2), "other_rpu": round(float(b.mean()), 2),
+                         "p_winner_better": round(sp, 3), "ci": [round(slo, 2), round(shi, 2)]})
+        flipped = [s for s in segs if s["ci"][1] < 0]
+        unclear = [s for s in segs if s["ci"][0] <= 0 <= s["ci"][1]]
+
+        significant = clo > 0 and cp > 0.99 and cseq < 0.05
+        comparisons.append({"other": {k: v for k, v in other.items() if k != "_ids"},
+                            "diff_ci95": [round(clo, 2), round(chi, 2)],
+                            "p_winner_better": round(cp, 4), "sequential_p": float(f"{cseq:.3g}"),
+                            "significant": significant,
+                            "guardrails": {"winner": gw, "other": gl, "refund_p": round(refund_p, 4),
+                                           "billing_p": round(billing_p, 4), "failed": [n for n, _ in guard_fail]},
+                            "segments": segs, "segments_flipped": len(flipped), "segments_unclear": len(unclear),
+                            "passed": bool(significant and srm_p > 0.01 and bal_p > 0.001
+                                           and not guard_fail and not flipped)})
+    first = comparisons[0]
+    guard_fail = [(f"{c['other']['name']}: {n}", c["guardrails"]["refund_p" if n == "refund rate" else "billing_p"])
+                  for c in comparisons for n in c["guardrails"]["failed"]]
+    segs = [{**s, "other_arm": c["other"]["name"]} for c in comparisons for s in c["segments"]]
+    flipped = [s for s in segs if s["ci"][1] < 0]
+    unclear = [s for s in segs if s["ci"][0] <= 0 <= s["ci"][1]]
 
     # metric maturity: early comparisons favour the arm that collects its revenue sooner
     mw, ml = maturity(t, win["_ids"], horizon), maturity(t, lose["_ids"], horizon)
@@ -357,36 +395,23 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                       f"{slow['name']} {sm[1]:.0%}. A dashboard read in the first days favours {fast['name']}, "
                       f"whatever the final winner.")
 
-    # segment consistency, Bonferroni-corrected
-    segs = []
-    groups = [(col, val, g) for col in ["intent", "platform", "acquisition_channel"] for val, g in e.groupby(col)]
-    k = max(1, sum(1 for *_, g in groups if min(g.user_id.isin(win["_ids"]).sum(), g.user_id.isin(lose["_ids"]).sum()) >= 80))
-    for col, val, g in groups:
-        a = g[g.user_id.isin(win["_ids"])].revenue.values
-        b = g[g.user_id.isin(lose["_ids"])].revenue.values
-        if min(a.size, b.size) < 80:
-            continue
-        slo, shi, sp = boot(a, b, 1000, alpha=0.05 / k)
-        segs.append({"dimension": col, "value": str(val), "users": int(a.size + b.size),
-                     "winner_rpu": round(float(a.mean()), 2), "other_rpu": round(float(b.mean()), 2),
-                     "p_winner_better": round(sp, 3), "ci": [round(slo, 2), round(shi, 2)]})
-    flipped = [s for s in segs if s["ci"][1] < 0]
-    unclear = [s for s in segs if s["ci"][0] <= 0 <= s["ci"][1]]
-
-    # money: one month of new installs on every non-winning arm, each followed for the horizon
+    # Money counts only arms the winner verifiably beats, each followed for the horizon.
     days = (e_all.install_at.max() - e_all.install_at.min()).days or 1
     daily_users = len(e_all) / days * (LIVE_USERS / OFFLINE_USERS)
     total_w = float(w.sum())
     lost_month = daily_users * 30 * sum(a["weight"] / total_w * (win["rev_per_user"] - a["rev_per_user"])
-                                        for a in ranked[1:])
+                                        for c in comparisons if c["passed"] for a in [c["other"]])
     losing_share = sum(a["weight"] for a in ranked[1:]) / total_w
 
-    decided = lo > 0 and p > 0.99 and seq_p < 0.05
+    decided = all(c["significant"] for c in comparisons)
     healthy = srm_p > 0.01 and bal_p > 0.001
     n_needed = sample_size_per_arm(np.concatenate([w_rev, l_rev]))
+    applied_winner = test.get("winner_flow_id")
     if test["state"] == "completed":  # same checks as a live rollout: health, guardrails, segments
         verdict = ("completed_inconclusive" if not decided else
-                   "completed_check_failed" if not healthy or guard_fail or flipped else "completed_confirmed")
+                   "completed_check_failed" if not healthy or guard_fail or flipped else
+                   "completed_winner_unknown" if not applied_winner else
+                   "completed_disagrees" if applied_winner != win["content_id"] else "completed_confirmed")
     elif not healthy:
         verdict = "check_data"
     elif decided and guard_fail:
@@ -399,26 +424,33 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
         verdict = "keep_running"
 
     reasons = [f"{win['name']} earns ${win['rev_per_user']:.2f} vs ${lose['rev_per_user']:.2f} per user in "
-               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%}, always-valid p={seq_p:.2g})"
-               + (f"; {len(others)} more arm(s) further behind" if others else ""),
+               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%}, always-valid p={seq_p:.2g})",
                f"traffic split {'OK' if srm_p > 0.01 else 'BROKEN'} (SRM p={srm_p:.2f}), groups "
                f"{'balanced' if bal_p > 0.001 else 'UNBALANCED'} on intent (p={bal_p:.2f})",
                "guardrails OK (refunds, billing issues)" if not guard_fail else
                "guardrail failed: " + ", ".join(f"{n} worse (p={pv:.3f})" for n, pv in guard_fail),
                f"segments (Bonferroni-corrected): winner clearly ahead in {len(segs) - len(flipped) - len(unclear)} "
                f"of {len(segs)}, unclear in {len(unclear)}, reversed in {len(flipped)}"]
+    for c in comparisons[1:]:
+        reasons.append(f"vs {c['other']['name']}: 95% CI ${c['diff_ci95'][0]:.2f}…${c['diff_ci95'][1]:.2f}, "
+                       f"P(better) {c['p_winner_better']:.1%}, always-valid p={c['sequential_p']:.2g}; "
+                       + ("all checks passed" if c["passed"] else "not verified: rollout blocked"))
+    if verdict == "completed_winner_unknown":
+        reasons.append("applied winner is unknown: history cannot confirm what Adapty rolled out")
+    elif verdict == "completed_disagrees":
+        reasons.append(f"history disagrees with the applied winner {applied_winner}: history favours {win['name']}")
     if verdict == "keep_running":
         reasons.append(f"needs ≈{n_needed:,} matured users per arm to detect a {MDE:.0%} lift")
 
     for a in ranked:
         a.pop("_ids")
-    return {**base, "matured_users": int(len(e)), "arms": ranked, "winner": win, "loser": lose, "others": others,
+    return {**base, "matured_users": int(len(e)), "comparisons": comparisons, "applied_winner_id": applied_winner,
+            "arms": ranked, "winner": win, "loser": lose, "others": others,
             "losing_share": round(losing_share, 4),
             "lift_pct": round(100 * gap / lose["rev_per_user"], 1) if lose["rev_per_user"] else None,
             "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4), "sequential_p": float(f"{seq_p:.3g}"),
             "health": {"srm_pvalue": round(srm_p, 4), "balance_pvalue": round(bal_p, 4), "healthy": healthy},
-            "guardrails": {"winner": gw, "other": gl, "refund_p": round(refund_p, 4),
-                           "billing_p": round(billing_p, 4), "failed": [n for n, _ in guard_fail]},
+            "guardrails": first["guardrails"],
             "maturity": {"winner": mw, "other": ml, "early_bias": early_bias},
             "live_view": live_view(test, arms),
             "daily_users_in_test": round(daily_users, 1), "lost_per_month_usd": round(lost_month, 2),
@@ -434,14 +466,17 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
     days = (pl.install_at.max() - pl.install_at.min()).days or 1 if not pl.empty else 1
     daily = len(pl) / days * (LIVE_USERS / OFFLINE_USERS) if not pl.empty else 0
     n = sample_size_per_arm(hist.revenue.values) if len(hist) > 30 else None
-    days_needed = int(np.ceil(n * len(arms) / daily)) + base["horizon_days"] if n and daily and arms else None
+    weights = [a["weight"] for a in arms]
+    min_share = min(weights) / sum(weights) if weights and min(weights) > 0 else 0
+    days_needed = int(np.ceil(n / (daily * min_share))) + base["horizon_days"] if n and daily and min_share else None
     # smallest lift detectable with 30 days of enrolment at this traffic (n scales with 1/MDE^2)
-    n30 = daily * 30 / len(arms) if arms else 0
+    n30 = daily * 30 * min_share
     mde30 = MDE * np.sqrt(n / n30) if n and n30 else None
     return {**base, "verdict": "draft_plan", "baseline_rev_per_user": round(float(hist.revenue.mean()), 2)
             if len(hist) else None, "sample_size_per_arm": n, "daily_users_at_placement": round(daily, 1),
             "days_to_decision": days_needed, "mde_with_30_days_pct": round(100 * mde30, 0) if mde30 else None,
-            "recommendation": ("don't start: at this traffic the test can't reach a decision in a useful time"
+            "recommendation": ("can't size: not enough history/traffic at this placement" if days_needed is None else
+                               "don't start: at this traffic the test can't reach a decision in a useful time"
                                if days_needed and days_needed > 120 else "start it"),
             "reasons": [f"baseline ${hist.revenue.mean():.2f} per user at this placement ({len(hist):,} matured users)"
                         if len(hist) else "no history at this placement",
@@ -524,6 +559,7 @@ def mark_stopped(app_id: str, test_id: str) -> dict:
     for t in r["tests"]:
         if t["ab_test_id"] == test_id:
             t["state"], t["verdict"] = "completed", "completed_confirmed"
+            t["applied_winner_id"] = t["winner"]["content_id"]  # just acknowledged by the guarded stop
     r["total_lost_per_month_usd"] = decided_total(r["tests"])
     write_atomic(path, json.dumps(r, indent=2))
     return r

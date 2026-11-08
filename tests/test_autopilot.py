@@ -78,6 +78,7 @@ def test_after_stop_test_is_completed_and_money_drops(mocked):
     for x in mocked["tests"]:
         if x["title"] == ONB:
             x["state"] = "completed"
+            x["winner_flow_id"] = next(a["flow_id"] for a in x["flows"] if a["flow_name"] == "Onboarding - Weekly first")
     r = experiments.build_report()
     assert by_title(r)[ONB]["verdict"] == "completed_confirmed"
     assert r["total_lost_per_month_usd"] == pytest.approx(353.63, abs=1)
@@ -429,6 +430,7 @@ def test_copy_of_a_test_does_not_inherit_the_original_history(mocked):
     judged 'stop & roll out' and offered for an irreversible stop."""
     orig = next(x for x in mocked["tests"] if x["title"] == ONB)
     orig["state"] = "completed"
+    orig["winner_flow_id"] = next(a["flow_id"] for a in orig["flows"] if a["flow_name"] == "Onboarding - Weekly first")
     copy_ = copy.deepcopy(orig)
     copy_.update(ab_test_id="copy-1", state="live", started_at="2026-11-07T10:00:00Z")
     mocked["tests"].append(copy_)
@@ -510,3 +512,101 @@ def test_lift_against_a_zero_revenue_arm_never_prints_none(mocked):
 def test_dashboard_uses_the_shared_stop_path():
     src = (Path(__file__).parents[1] / "app.py").read_text()
     assert "execute_stop(" in src and "adapty_cli.stop_test(" not in src
+
+
+def test_three_arm_outlier_blocks_rollout_and_unverified_loss(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 10), ("b", 9), ("c", 8)], [1, 1, 1])
+    u.loc[u.flow == "a", "revenue"] = np.tile([9.8, 10.2], 300)
+    u.loc[u.flow == "b", "revenue"] = np.tile([8.8, 9.2], 300)
+    u.loc[u.flow == "c", "revenue"] = 0.0
+    u.loc[u.user_id == "c0", "revenue"] = 4800.0
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "keep_running"
+    assert "C" in " ".join(res["reasons"]) and "not verified" in " ".join(res["reasons"])
+    comparisons = {c["other"]["name"]: c for c in res["comparisons"]}
+    assert comparisons["B"]["passed"] and not comparisons["C"]["passed"]
+    assert comparisons["C"]["diff_ci95"][0] < 0 < comparisons["C"]["diff_ci95"][1]
+    daily = len(u) / 59 * 0.1
+    assert res["lost_per_month_usd"] == round(daily * 30 / 3 * (10 - 9), 2)
+
+
+@pytest.mark.parametrize("check, verdict", [("guardrail", "guardrail_failed"), ("segment", "split_by_segment")])
+def test_third_arm_safety_checks_can_block_rollout(monkeypatch, check, verdict):
+    import numpy as np
+    import pandas as pd
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 12), ("b", 8), ("c", 4)], [1, 1, 1])
+    if check == "guardrail":
+        t.loc[u.flow.isin(["a", "b"]) & (u.index % 600 < 120), "refunded_at"] = pd.Timestamp("2026-09-01")
+    else:
+        for flow, mean in [("a", 12), ("b", 8), ("c", 0.5)]:
+            u.loc[u.flow == flow, "revenue"] = mean + np.tile([-0.2, 0.2], 300)
+        u.loc[u.flow.eq("c") & (u.index % 600 < 100), "revenue"] += 19.5
+        u["platform"] = np.where(u.index % 600 < 100, "Android", "iOS")
+        t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["winner"]["name"] == "A" and res["loser"]["name"] == "B"
+    assert res["verdict"] == verdict
+    comparisons = {c["other"]["name"]: c for c in res["comparisons"]}
+    assert comparisons["B"]["passed"] and not comparisons["C"]["passed"]
+
+
+@pytest.mark.parametrize("applied, verdict", [("A", "completed_disagrees"),
+                                               (None, "completed_winner_unknown"),
+                                               ("B", "completed_confirmed")])
+def test_completed_confirmation_requires_the_applied_winner(monkeypatch, applied, verdict):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 4), ("b", 10)], [1, 1], state="completed")
+    test["winner_flow_id"] = applied
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == verdict
+    if applied != "B":
+        assert "applied winner" in " ".join(res["reasons"])
+
+
+def test_draft_sizing_uses_the_smallest_traffic_share(data):
+    import math
+    u, _ = data
+    base = {"placement_code": "ai_limit_reached", "horizon_days": 60}
+    balanced = experiments.plan_draft(base, [{"weight": 50}, {"weight": 50}], u, {})
+    skewed = experiments.plan_draft(base, [{"weight": 90}, {"weight": 10}], u, {})
+    pl = u[u.placement == base["placement_code"]]
+    daily = len(pl) / (pl.install_at.max() - pl.install_at.min()).days * 0.1
+    assert skewed["days_to_decision"] == math.ceil(skewed["sample_size_per_arm"] / (daily * 0.1)) + 60
+    assert skewed["days_to_decision"] > balanced["days_to_decision"]
+    assert skewed["mde_with_30_days_pct"] == round(100 * 0.1 * math.sqrt(skewed["sample_size_per_arm"] / (daily * 30 * 0.1)))
+
+
+@pytest.mark.parametrize("case", ["missing", "sparse", "zero_revenue", "zero_share"])
+def test_unsizeable_draft_never_recommends_start(data, case):
+    u, _ = data
+    u = u.copy()
+    base = {"placement_code": "ai_limit_reached", "horizon_days": 60}
+    arms = [{"weight": 50}, {"weight": 50}]
+    if case == "missing":
+        base["placement_code"] = "missing"
+    elif case == "sparse":
+        u = u.head(20)
+    elif case == "zero_revenue":
+        u["revenue"] = 0.0
+    else:
+        arms[1]["weight"] = 0
+    res = experiments.plan_draft(base, arms, u, {})
+    assert res["days_to_decision"] is None
+    assert res["recommendation"] == "can't size: not enough history/traffic at this placement"
+
+
+def test_dashboard_draft_summary_matches_recommendation(mocked, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    r = experiments.build_report()
+    draft = next(t for t in r["tests"] if t["state"] == "draft")
+    draft["recommendation"] = "start it"
+    experiments.write_atomic(experiments.report_path(), json.dumps(r))
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"}])
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    assert not ui.exception
+    table = ui.dataframe[0].value.set_index("test")
+    assert "start it" in table.loc[draft["title"], "verdict"]

@@ -25,6 +25,8 @@ VERDICT = {
     "keep_running": ("⏳ Not decided yet — keep running", "info"),
     "completed_confirmed": ("✅ Completed — full history confirms the result", "success"),
     "completed_inconclusive": ("⚠️ Completed — on full history the result is NOT significant", "warning"),
+    "completed_disagrees": ("⚠️ Completed — history disagrees with the applied winner", "warning"),
+    "completed_winner_unknown": ("⚠️ Completed — applied winner unknown; cannot confirm", "warning"),
     "completed_check_failed": ("🧯 Completed — winner on revenue, but a health, guardrail or segment check failed",
                                "warning"),
     "draft_plan": ("📐 Draft — sample-size plan before you start", "info"),
@@ -34,7 +36,8 @@ SHORT = {"stop_and_roll_out": "💰 stop & roll out", "split_by_segment": "🔀 
          "guardrail_failed": "🚧 guardrail failed", "check_data": "🧯 check data", "keep_running": "⏳ keep running",
          "completed_confirmed": "✅ confirmed", "completed_inconclusive": "⚠️ not significant",
          "completed_check_failed": "🧯 check failed",
-         "draft_plan": "📐 don't start" , "unsupported": "➖ no history"}
+         "completed_disagrees": "⚠️ history disagrees", "completed_winner_unknown": "⚠️ winner unknown",
+         "unsupported": "➖ no history"}
 
 
 @st.cache_data(show_spinner="Reading Adapty tests and 4 months of history…", max_entries=4)
@@ -148,7 +151,8 @@ def our_view(t: dict) -> str:
 
 st.dataframe(pd.DataFrame([{
     "test": t["title"],
-    "verdict": SHORT.get(t["verdict"], t["verdict"]),
+    "verdict": ("📐 " + t["recommendation"].split(":")[0] if t["verdict"] == "draft_plan"
+                else SHORT.get(t["verdict"], t["verdict"])),
     "$ / month": f"${t['lost_per_month_usd']:,.0f}" if t["state"] == "live" and t.get("lost_per_month_usd") else "",
     f"matured {t['horizon_days']}-day": our_view(t),
     "Adapty right now": adapty_view(t),
@@ -207,12 +211,14 @@ for t in tests:
                         f"- Randomization balance (intent score): p = {hc['balance_pvalue']} "
                         f"{'✅' if hc['balance_pvalue'] > 0.001 else '❌'}")
         with h2.expander("Guardrails (per charge)"):
-            g = t["guardrails"]
-            st.dataframe(pd.DataFrame([
-                {"metric": "refund rate", "winner": f"{g['winner']['refund_rate']:.2%}",
-                 "other": f"{g['other']['refund_rate']:.2%}", "p": g["refund_p"]},
-                {"metric": "billing-issue rate", "winner": f"{g['winner']['billing_issue_rate']:.2%}",
-                 "other": f"{g['other']['billing_issue_rate']:.2%}", "p": g["billing_p"]}]), hide_index=True)
+            for comparison in t["comparisons"]:
+                g = comparison["guardrails"]
+                st.caption(f"vs {comparison['other']['name']}")
+                st.dataframe(pd.DataFrame([
+                    {"metric": "refund rate", "winner": f"{g['winner']['refund_rate']:.2%}",
+                     "other": f"{g['other']['refund_rate']:.2%}", "p": g["refund_p"]},
+                    {"metric": "billing-issue rate", "winner": f"{g['winner']['billing_issue_rate']:.2%}",
+                     "other": f"{g['other']['billing_issue_rate']:.2%}", "p": g["billing_p"]}]), hide_index=True)
         with h3.expander("Revenue maturity"):
             mat = pd.DataFrame([{"day": int(d), "arm": arm, "share": share}
                                 for k, arm in [("winner", t["winner"]["name"]), ("other", t["loser"]["name"])]
