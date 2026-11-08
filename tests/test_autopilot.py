@@ -610,3 +610,54 @@ def test_dashboard_draft_summary_matches_recommendation(mocked, monkeypatch):
     assert not ui.exception
     table = ui.dataframe[0].value.set_index("test")
     assert "start it" in table.loc[draft["title"], "verdict"]
+
+
+def test_report_records_analysis_time_and_data_sources(mocked):
+    from datetime import datetime, timezone
+    before = datetime.now(timezone.utc)
+    r = experiments.build_report()
+    assert before <= datetime.fromisoformat(r["analyzed_at"]) <= datetime.now(timezone.utc)
+    assert r["sources"] == {"adapty": "Adapty API (live)", "history": "synthetic history"}
+    assert r["data_end"].startswith("2026-11-03")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_dashboard_saved_report_has_source_dates_and_age(mocked, monkeypatch, legacy):
+    from datetime import datetime, timedelta, timezone
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    r = experiments.build_report()
+    r["analyzed_at"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    if legacy:
+        r["schema"] = experiments.REPORT_SCHEMA - 1
+        r.pop("analyzed_at")
+        for t in r["tests"]:
+            t.pop("comparisons", None)
+    experiments.write_atomic(experiments.report_path(), json.dumps(r))
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"}])
+    def offline(*args):
+        raise RuntimeError("offline")
+    monkeypatch.setattr(experiments, "build_report", offline)
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    assert not ui.exception
+    warnings = " ".join(w.value for w in ui.warning)
+    assert "saved report (offline)" in warnings
+    assert "analysis time unknown" in warnings if legacy else "3.0 hours old" in warnings
+    captions = " ".join(c.value for c in ui.caption)
+    assert "synthetic history" in captions and "2026-11-03" in captions and "Last analysis" in captions
+    assert "Adapty API (live)" not in captions
+
+
+def test_dashboard_live_badge_requires_a_fresh_analysis(mocked, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    r = experiments.build_report()
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"}])
+    monkeypatch.setattr(experiments, "build_report", lambda *a: r)
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    ui.button[0].click().run(timeout=30)
+    assert not ui.exception
+    assert "Adapty API (live)" in " ".join(c.value for c in ui.caption)
+    assert not any("saved report (offline)" in w.value for w in ui.warning)

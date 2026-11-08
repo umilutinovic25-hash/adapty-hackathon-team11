@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -49,7 +49,7 @@ def flow_names() -> dict[str, str]:
     return {**FALLBACK_FLOW_NAMES, **found}  # a flow the regex misses still maps
 
 
-REPORT_SCHEMA = 6  # bump when the report's keys change; readers rebuild older reports
+REPORT_SCHEMA = 7  # bump when the report's keys change; readers rebuild older reports
 def history_apps() -> set[str]:
     """Apps seeded from the offline dataset: the default app always, plus OFFLINE_APP_IDS (comma-separated),
     e.g. a rehearsal copy. Read at call time so a changed environment takes effect."""
@@ -534,6 +534,7 @@ def build_report(app_id: str | None = None) -> dict:
         bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
         report = {
             "schema": REPORT_SCHEMA, "app_id": app_id, "has_history": has_history, "data_end": str(end),
+            "sources": {"adapty": "Adapty API (live)", "history": "synthetic history" if has_history else None},
             "horizon_days": HORIZON_DAYS,
             "segment_names": {s["id"]: s["title"] for s in adapty_cli.run("segments", "list")["data"]},
             "tests": judged,
@@ -547,6 +548,7 @@ def build_report(app_id: str | None = None) -> dict:
                 "payer_rate_by_intent": {k: round(float(m[m.intent == k].payer.mean() or 0), 3)
                                          for k in ["low", "mid", "high"]}},
         }
+    report["analyzed_at"] = datetime.now(timezone.utc).isoformat()
     out_dir().mkdir(parents=True, exist_ok=True)
     write_atomic(report_path(app_id), json.dumps(report, indent=2))
     return report
@@ -577,7 +579,8 @@ def portfolio() -> list[dict]:
         live = [t for t in r["tests"] if t["state"] == "live"]
         rows.append({"app_id": app["id"], "app": app["title"], "tests": len(r["tests"]), "live": len(live),
                      "decided_live": sum(t["verdict"] == "stop_and_roll_out" for t in live),
-                     "lost_per_month_usd": r["total_lost_per_month_usd"], "has_history": r["has_history"]})
+                     "lost_per_month_usd": r["total_lost_per_month_usd"], "has_history": r["has_history"],
+                     "analyzed_at": r["analyzed_at"], "history_through": r["data_end"] if r["has_history"] else None})
     out_dir().mkdir(parents=True, exist_ok=True)
     write_atomic(portfolio_path(), json.dumps(rows, indent=2))
     return rows

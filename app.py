@@ -89,23 +89,51 @@ APP_ID = app["id"]
 REPORT = report_path(APP_ID)
 
 
-def safe_build(why: str) -> None:
+def safe_build(why: str) -> bool:
+    built = False
     with st.spinner(why):
         try:
             build_report(APP_ID)
+            built = True
         except Exception as err:  # noqa: BLE001 - keep showing the last saved report when Adapty is unreachable
             st.warning(f"Couldn't reach Adapty ({err}). Showing the last saved analysis.")
     load_report.clear()
+    return built
 
 
+fresh_analysis = False
 if top2.button("↻ Re-run analysis (Adapty CLI + offline history)", use_container_width=True):
-    safe_build("Reading Adapty tests and 4 months of history…")
+    fresh_analysis = safe_build("Reading Adapty tests and 4 months of history…")
 if not REPORT.exists() or json.loads(REPORT.read_text()).get("schema") != REPORT_SCHEMA:
-    safe_build("First run for this app: reading Adapty tests and history…")
+    fresh_analysis = safe_build("First run for this app: reading Adapty tests and history…")
 if not REPORT.exists():
     st.error("No analysis yet and Adapty is unreachable. Connect and press Re-run.")
     st.stop()
 r = load_report(str(REPORT), report_mtime(REPORT))
+api_source = "Adapty API (live)" if fresh_analysis else "saved report (offline)"
+analyzed_at = pd.to_datetime(r.get("analyzed_at"), utc=True, errors="coerce")
+if pd.isna(analyzed_at):
+    analyzed_at = None
+analysis_label = (analyzed_at.strftime("%Y-%m-%d %H:%M:%S UTC") if analyzed_at is not None else "unknown")
+history_label = str(r.get("data_end", "unknown"))[:10] if r.get("has_history", True) else "no history for this app"
+if not fresh_analysis:
+    age_from = analyzed_at if analyzed_at is not None else pd.Timestamp(report_mtime(REPORT), unit="ns", tz="UTC")
+    age_hours = max(0, (pd.Timestamp.now(tz="UTC") - age_from).total_seconds() / 3600)
+    age_note = "analysis time unknown; file age" if analyzed_at is None else "analysis age"
+    st.warning(f"Showing a saved report (offline): {age_hours:.1f} hours old ({age_note}). "
+               "Re-run analysis for a fresh Adapty read.")
+
+
+def provenance(target=st, *, history: bool = True, api: bool = True) -> None:
+    sources = [api_source] if api else []
+    if history and r.get("has_history", True):
+        sources.append("synthetic history")
+    dates = f"Last analysis: {analysis_label}"
+    if history:
+        dates += f" · History through: {history_label}"
+    target.caption(" · ".join(f"**{source}**" for source in sources) + " · " + dates)
+
+
 if st.session_state.get("flash"):
     st.success(st.session_state.pop("flash"))
 if not r.get("has_history", True):
@@ -126,6 +154,7 @@ hero.markdown(f"<div style='font-size:15px;opacity:.75'>Lost per month on decide
 c2.metric("Early reads that are immature", sum(1 for t in live if (t.get("live_view") or {}).get("immature")),
           help="Live tests where most trials in Adapty haven't finished yet")
 c3.metric("Completed but not significant", sum(1 for t in tests if t["verdict"] == "completed_inconclusive"))
+provenance()
 names = r.get("segment_names", {})
 
 
@@ -165,6 +194,7 @@ for t in tests:
     label, kind = VERDICT.get(t["verdict"], (t["verdict"], "info"))
     with st.container(border=True):
         st.subheader(f"{t['title']}  ·  {t['placement']}  ·  `{t['state']}`")
+        provenance()
         getattr(st, kind)(label)
 
         if t["verdict"] == "draft_plan":
@@ -195,6 +225,8 @@ for t in tests:
 
         lv = t.get("live_view")
         left, right = st.columns(2)
+        provenance(left, history=False)
+        provenance(right, api=False)
         left.info(f"**Adapty right now** (since {lv['since']}, users in this test only)\n\n{adapty_view(t)}"
                   if lv else "**Adapty right now**\n\nno live data for this test yet")
         right.success(f"**Matured {t['horizon_days']}-day revenue, full history**\n\n{our_view(t)} · "
@@ -211,7 +243,7 @@ for t in tests:
                         f"- Randomization balance (intent score): p = {hc['balance_pvalue']} "
                         f"{'✅' if hc['balance_pvalue'] > 0.001 else '❌'}")
         with h2.expander("Guardrails (per charge)"):
-            for comparison in t["comparisons"]:
+            for comparison in t.get("comparisons", [{"other": t["loser"], "guardrails": t["guardrails"]}]):
                 g = comparison["guardrails"]
                 st.caption(f"vs {comparison['other']['name']}")
                 st.dataframe(pd.DataFrame([
@@ -273,6 +305,7 @@ for t in tests:
 if r.get("intent"):
     st.divider()
     st.subheader("Who buys? (intent model on day-one signals)")
+    provenance(api=False)
     i1, i2 = st.columns(2)
     rev = r["intent"]["rev_per_user_by_intent"]
     i1.altair_chart(bar(pd.DataFrame({"intent": list(rev), "revenue": list(rev.values())}), "intent", "revenue",
@@ -288,6 +321,7 @@ if r.get("intent"):
 st.divider()
 p1, p2 = st.columns(2)
 with p1.expander("📬 Daily digest for Slack"):
+    provenance()
     msg = notify.digest(r, app["title"])
     preview = "\n\n".join(b["text"]["text"] for b in msg["blocks"] if b.get("type") in ("header", "section"))
     st.markdown(re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", preview))  # Slack *bold* → Markdown **bold**
@@ -299,6 +333,8 @@ with p2.expander("🗂️ Portfolio: every app on this Adapty account"):
         with st.spinner("Judging every app…"):
             portfolio()
     if pf_path.exists():
+        st.caption("**saved report (offline)** · Last analysis and history through: per-app columns "
+                   "(unknown in older scans). History applies only to seeded apps.")
         st.dataframe(pd.DataFrame(json.loads(pf_path.read_text())).drop(columns=["app_id"]), hide_index=True,
                      use_container_width=True)
         st.caption(f"Last scan: {pd.Timestamp(pf_path.stat().st_mtime, unit='s'):%Y-%m-%d %H:%M} UTC")
