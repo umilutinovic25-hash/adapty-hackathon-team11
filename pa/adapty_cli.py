@@ -113,8 +113,13 @@ def stop_command(test_id: str, winner_id: str, app_id: str | None = None) -> lis
 
 
 def stop_test(test_id: str, winner_id: str, app_id: str | None = None) -> dict:
-    """Irreversible. Callers should pass app_id explicitly."""
+    """Irreversible. Callers should pass app_id explicitly. Exit code 0 is the success signal: once Adapty has
+    stopped the test, unexpected stdout must not raise, or the caller would skip the audit log."""
     out = _call(stop_command(test_id, winner_id, app_id))
     if out.returncode != 0:
         raise AdaptyError(_message((out.stderr or out.stdout).strip()))
-    return json.loads(out.stdout) if out.stdout.strip() else {"ok": True}
+    try:
+        res = json.loads(out.stdout) if out.stdout.strip() else {}
+    except ValueError:
+        return {"ok": True, "raw": out.stdout.strip()[:500]}
+    return res if isinstance(res, dict) and res else {"ok": True, "raw": res}

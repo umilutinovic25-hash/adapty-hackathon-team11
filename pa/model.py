@@ -66,9 +66,9 @@ class Result:
 
 
 def bootstrap_diff(a: np.ndarray, b: np.ndarray, n: int = 2000) -> tuple[float, float]:
-    rng = np.random.default_rng(SEED)
-    diffs = [rng.choice(a, a.size).mean() - rng.choice(b, b.size).mean() for _ in range(n)]
-    return float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))
+    from pa.experiments import boot  # noqa: PLC0415 - one bootstrap for the project; experiments imports this module
+    lo, hi, _ = boot(a, b, n)
+    return lo, hi
 
 
 def run() -> tuple[Result, Pipeline, pd.DataFrame]:

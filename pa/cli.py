@@ -14,10 +14,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pa import adapty_cli, notify
-from pa.experiments import REPORT_SCHEMA, build_report, portfolio, report_path
+from pa import adapty_cli, notify, out_dir
+from pa.experiments import REPORT_SCHEMA, build_report, mark_stopped, portfolio, report_path
 
-AUDIT = Path("out/audit.log")
+def audit_path() -> Path:
+    return out_dir() / "audit.log"
 
 
 def report(fresh: bool, app_id: str | None = None) -> dict:
@@ -49,12 +50,24 @@ def brief(r: dict) -> str:
     return "\n".join(lines)
 
 
+class StopRefused(RuntimeError):
+    """The Change Guard refused to act; nothing was sent to Adapty."""
+
+
 def plan(r: dict, test_id: str) -> dict:
+    """Change Guard plan for the CLI: exits with the refusal message instead of raising."""
+    try:
+        return make_plan(r, test_id)
+    except StopRefused as err:
+        sys.exit(str(err))
+
+
+def make_plan(r: dict, test_id: str) -> dict:
     t = next((x for x in r["tests"] if x["ab_test_id"] == test_id), None)
     if t is None:
-        sys.exit(f"unknown test {test_id}")
+        raise StopRefused(f"unknown test {test_id}")
     if t["verdict"] != "stop_and_roll_out":
-        sys.exit(f"refusing: verdict is {t['verdict']}, not stop_and_roll_out")
+        raise StopRefused(f"refusing: verdict is {t['verdict']}, not stop_and_roll_out")
     names = r.get("segment_names", {})
     audience = ", ".join(names.get(s, s) for s in t["segment_ids"]) or "all users"
     losers = ", ".join(a["name"] for a in t["arms"][1:])
@@ -64,6 +77,26 @@ def plan(r: dict, test_id: str) -> dict:
             "affected": f"{t['losing_share']:.0%} now on {losers} "
                         f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} new users/day)",
             "expected_effect_usd_per_month": t["lost_per_month_usd"], "reversible": False, "command": command}
+
+
+def execute_stop(test_id: str, winner_id: str, approved_by: str, app_id: str | None = None) -> dict:
+    """The one stop path for the CLI and the dashboard: re-judge on fresh data, check the approved winner, stop in
+    Adapty, write the audit entry, then mark the saved report. Raises StopRefused before touching Adapty."""
+    if not approved_by.strip():
+        raise StopRefused("refusing: name the approver (--approved-by) before stopping a test")
+    pln = make_plan(report(fresh=True, app_id=app_id), test_id)  # re-judge on fresh data right before acting
+    if pln["winner_id"] != winner_id:
+        raise StopRefused(f"refusing: fresh data picks {pln['winner']} ({pln['winner_id']}), not the approved "
+                          f"winner {winner_id}. Run `plan` again and get a new approval.")
+    res = adapty_cli.stop_test(test_id, pln["winner_id"], app_id=pln["app_id"])
+    entry = {"at": datetime.now(timezone.utc).isoformat(), "approved_by": approved_by.strip(), "action": "stop",
+             **pln, "result": res}
+    audit = audit_path()
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    with audit.open("a") as f:  # written before anything else can fail: the stop already happened
+        f.write(json.dumps(entry) + "\n")
+    mark_stopped(pln["app_id"], test_id)  # the saved report shows it as completed, so Stop isn't offered again
+    return entry
 
 
 def main() -> None:
@@ -90,16 +123,11 @@ def main() -> None:
     elif a.cmd == "plan":
         print(json.dumps(plan(report(fresh=False, app_id=a.app), a.test_id), indent=2))
     elif a.cmd == "stop":
-        pln = plan(report(fresh=True, app_id=a.app), a.test_id)  # re-judge on fresh data right before acting
-        if pln["winner_id"] != a.winner_id:
-            sys.exit(f"refusing: fresh data picks {pln['winner']} ({pln['winner_id']}), not the approved winner "
-                     f"{a.winner_id}. Run `plan` again and get a new approval.")
-        res = adapty_cli.stop_test(a.test_id, pln["winner_id"], app_id=pln["app_id"])
-        AUDIT.parent.mkdir(exist_ok=True)
-        with AUDIT.open("a") as f:
-            f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "approved_by": a.approved_by,
-                                "action": "stop", **pln, "result": res}) + "\n")
-        print(json.dumps({"stopped": True, **pln}, indent=2))
+        try:
+            entry = execute_stop(a.test_id, a.winner_id, a.approved_by, app_id=a.app)
+        except StopRefused as err:
+            sys.exit(str(err))
+        print(json.dumps({"stopped": True, **entry}, indent=2))
     elif a.cmd == "portfolio":
         rows = portfolio()
         print("| app | tests | live | decided | $/month | history |\n|---|---|---|---|---|---|")

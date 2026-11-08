@@ -13,7 +13,8 @@ import pandas as pd
 import streamlit as st
 
 from pa import adapty_cli, notify
-from pa.experiments import REPORT_SCHEMA, build_report, mark_stopped, portfolio, report_path
+from pa.cli import StopRefused, execute_stop
+from pa.experiments import REPORT_SCHEMA, build_report, portfolio, portfolio_path, report_path
 
 st.set_page_config(page_title="Experiment Autopilot", page_icon="🧪", layout="wide")
 VERDICT = {
@@ -24,12 +25,15 @@ VERDICT = {
     "keep_running": ("⏳ Not decided yet — keep running", "info"),
     "completed_confirmed": ("✅ Completed — full history confirms the result", "success"),
     "completed_inconclusive": ("⚠️ Completed — on full history the result is NOT significant", "warning"),
+    "completed_check_failed": ("🧯 Completed — winner on revenue, but a health, guardrail or segment check failed",
+                               "warning"),
     "draft_plan": ("📐 Draft — sample-size plan before you start", "info"),
     "unsupported": ("➖ Can't judge on history yet — showing what Adapty sees", "info"),
 }
 SHORT = {"stop_and_roll_out": "💰 stop & roll out", "split_by_segment": "🔀 split by segment",
          "guardrail_failed": "🚧 guardrail failed", "check_data": "🧯 check data", "keep_running": "⏳ keep running",
          "completed_confirmed": "✅ confirmed", "completed_inconclusive": "⚠️ not significant",
+         "completed_check_failed": "🧯 check failed",
          "draft_plan": "📐 don't start" , "unsupported": "➖ no history"}
 
 
@@ -139,7 +143,7 @@ def our_view(t: dict) -> str:
         return "–"
     if t["verdict"] == "draft_plan":
         return f"needs ≈{t['days_to_decision'] or '?'} days → {t['recommendation'].split(':')[0]}"
-    return f"{t['winner']['name'].split(' - ')[-1]} +{t['lift_pct']}% (P {t['p_winner_better']:.0%})"
+    return f"{t['winner']['name'].split(' - ')[-1]} {notify.lift_text(t)} (P {t['p_winner_better']:.0%})"
 
 
 st.dataframe(pd.DataFrame([{
@@ -176,7 +180,7 @@ for t in tests:
 
         a, b, c = st.columns([2, 2, 3])
         a.metric(f"🏆 {t['winner']['name']}", f"${t['winner']['rev_per_user']:.2f} / user",
-                 f"+{t['lift_pct']}% vs other arm")
+                 f"{notify.lift_text(t)} vs other arm" if t["lift_pct"] is not None else "other arm earns $0")
         a.caption(f"payer rate {t['winner']['payer_rate']:.1%} · {t['winner']['users']:,} matured users")
         b.metric(t["loser"]["name"], f"${t['loser']['rev_per_user']:.2f} / user")
         b.caption(f"payer rate {t['loser']['payer_rate']:.1%} · {t['loser']['users']:,} matured users"
@@ -242,29 +246,23 @@ for t in tests:
             with st.expander("Show the Adapty CLI command"):
                 st.code(" ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"], app_id=APP_ID)),
                         language="bash")
+            who = st.text_input("Approved by (your name, for the audit log)", key=f"who-{t['ab_test_id']}")
             ok = st.checkbox("I reviewed the plan and approve stopping this test", key=f"ok-{t['ab_test_id']}")
-            if st.button("Stop test & roll out winner", key=f"go-{t['ab_test_id']}", disabled=not ok, type="primary"):
+            if st.button("Stop test & roll out winner", key=f"go-{t['ab_test_id']}",
+                         disabled=not (ok and who.strip()), type="primary"):
                 try:
                     with st.spinner("Re-checking on fresh Adapty data before acting…"):
-                        fresh = {x["ab_test_id"]: x for x in build_report(APP_ID)["tests"]}.get(t["ab_test_id"])
-                    if (not fresh or fresh["verdict"] != "stop_and_roll_out"
-                            or fresh["winner"]["content_id"] != t["winner"]["content_id"]):
-                        load_report.clear()
-                        raise RuntimeError("the fresh data no longer supports this plan (test changed or another "
-                                           "winner); review the updated card and approve again")
-                    res = adapty_cli.stop_test(t["ab_test_id"], t["winner"]["content_id"], app_id=APP_ID)
-                    entry = {"at": pd.Timestamp.now(tz="UTC").isoformat(), "approved_by": "dashboard user",
-                             "action": "stop", "app_id": APP_ID, "test": t["title"], "winner": t["winner"]["name"],
-                             "result": res}
+                        entry = execute_stop(t["ab_test_id"], t["winner"]["content_id"], who, app_id=APP_ID)
                     st.session_state.log.append(entry)
-                    with Path("out/audit.log").open("a") as f:
-                        f.write(json.dumps(entry) + "\n")
-                    mark_stopped(APP_ID, t["ab_test_id"])  # card turns to completed; no second click possible
-                    load_report.clear()
                     st.session_state.flash = f"Stopped “{t['title']}” in Adapty — {t['winner']['name']} rolled out."
-                    st.rerun()
+                except StopRefused as err:
+                    st.error(f"Not stopped: {err}. Review the updated card and approve again.")
                 except RuntimeError as err:
                     st.error(f"Not stopped: {err}")
+                finally:  # the fresh re-check (and a stop) rewrote the saved report: show it either way
+                    load_report.clear()
+                if st.session_state.get("flash"):
+                    st.rerun()
 
 if r.get("intent"):
     st.divider()
@@ -290,7 +288,7 @@ with p1.expander("📬 Daily digest for Slack"):
     st.caption("`uv run python -m pa.cli notify` posts this when SLACK_WEBHOOK_URL is set (e.g. daily via cron); "
                "the button links back here, so approval still happens in the Change Guard.")
 with p2.expander("🗂️ Portfolio: every app on this Adapty account"):
-    pf_path = Path("out/portfolio.json")
+    pf_path = portfolio_path()
     if st.button("Scan all apps"):
         with st.spinner("Judging every app…"):
             portfolio()

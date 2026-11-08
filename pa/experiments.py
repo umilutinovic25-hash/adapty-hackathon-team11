@@ -24,7 +24,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.model_selection import KFold
 
-from pa import adapty_cli, project_path
+from pa import adapty_cli, out_dir, project_path
 from pa.model import CAT, NUM, DATA_DIR, build_model
 
 HORIZON_DAYS = 60  # the onboarding test's own goal: "60-day revenue per install"
@@ -38,7 +38,6 @@ FALLBACK_FLOW_NAMES = {
 LIVE_USERS, OFFLINE_USERS = 5000, 50000  # Adapty account vs offline copy of the same population
 MDE = 0.10  # smallest relative revenue lift worth detecting, for sample-size planning
 SEED = 7
-OUT = Path("out")
 
 
 def flow_names() -> dict[str, str]:
@@ -83,10 +82,13 @@ def load(horizon: int = HORIZON_DAYS) -> tuple[pd.DataFrame, pd.DataFrame, pd.Ti
 
 
 def add_intent(u: pd.DataFrame) -> pd.DataFrame:
-    """Cross-fitted intent score (2 folds): no user is scored by a model that saw them."""
+    """Cross-fitted intent score (2 folds): no user is scored by a model that saw them. Trained only on matured users
+    (their payer label is final), so the score doesn't learn 'recent install = not a payer yet'; everyone is scored."""
     u = u.copy()
     u["intent_score"] = np.nan
+    matured = u.matured.to_numpy()
     for tr, te in KFold(2, shuffle=True, random_state=SEED).split(u):
+        tr = tr[matured[tr]]
         m = build_model().fit(u.iloc[tr][CAT + NUM], u.iloc[tr].payer)
         u.iloc[te, u.columns.get_loc("intent_score")] = m.predict_proba(u.iloc[te][CAT + NUM])[:, 1]
     lo, hi = np.quantile(u.intent_score, [0.4, 0.8])
@@ -95,13 +97,43 @@ def add_intent(u: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- statistics
-def boot(a: np.ndarray, b: np.ndarray, n: int = 3000, alpha: float = 0.05) -> tuple[float, float, float]:
-    """(1-alpha) CI of mean(a)-mean(b) and P(mean(a) > mean(b))."""
-    rng = np.random.default_rng(SEED)
-    d = np.array([rng.choice(a, a.size).mean() - rng.choice(b, b.size).mean() for _ in range(n)])
+MIN_TAIL_DRAWS = 50  # bootstrap draws beyond each CI bound, so a Bonferroni-corrected bound isn't set by a few draws
+
+
+def boot_n(n: int, alpha: float) -> int:
+    """Draws needed so each tail of a (1-alpha) interval holds at least MIN_TAIL_DRAWS of them."""
+    return max(n, int(np.ceil(MIN_TAIL_DRAWS / (alpha / 2))))
+
+
+def _boot_means(x: np.ndarray, n: int, rng: np.random.Generator, chunk: int = 500) -> np.ndarray:
+    return np.concatenate([x[rng.integers(0, x.size, (min(chunk, n - i), x.size))].mean(axis=1)
+                           for i in range(0, n, chunk)])
+
+
+def boot(a: np.ndarray, b: np.ndarray, n: int = 3000, alpha: float = 0.05,
+         seed: int = SEED) -> tuple[float, float, float]:
+    """(1-alpha) CI of mean(a)-mean(b) and P(mean(a) > mean(b)), with enough draws for the tails alpha asks for."""
+    rng = np.random.default_rng(seed)
+    n = boot_n(n, alpha)
+    d = _boot_means(np.asarray(a, float), n, rng) - _boot_means(np.asarray(b, float), n, rng)
     return (float(np.percentile(d, 100 * alpha / 2)), float(np.percentile(d, 100 * (1 - alpha / 2))),
             float((d > 0).mean()))
 
+
+
+def always_valid_p(a: np.ndarray, b: np.ndarray, mde: float = MDE) -> float:
+    """Always-valid p-value for mean(a) != mean(b) (mixture SPRT, Johari et al. 2017, normal approximation).
+    The dashboard and the daily cron re-check the same test again and again; a fixed-horizon test peeked at every day
+    declares false winners far more often than 5%. This p-value stays valid however often it is looked at.
+    Mixture width tau = the smallest lift worth detecting (MDE x baseline revenue per user)."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    v = a.var(ddof=1) / a.size + b.var(ddof=1) / b.size
+    tau2 = (mde * np.concatenate([a, b]).mean()) ** 2
+    if v <= 0 or tau2 <= 0:
+        return 1.0
+    d = a.mean() - b.mean()
+    log_lr = 0.5 * np.log(v / (v + tau2)) + tau2 * d * d / (2 * v * (v + tau2))
+    return float(min(1.0, np.exp(-log_lr)))
 
 
 def sample_size_per_arm(values: np.ndarray, mde: float = MDE, alpha: float = 0.05, power: float = 0.8) -> int:
@@ -242,7 +274,21 @@ def unsupported(base: dict, test: dict, why: str) -> dict:
     return {**base, "verdict": "unsupported", "reasons": [why], "live_view": live_view(test, base["arms_config"])}
 
 
-def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements: dict | None = None) -> dict | None:
+def history_owners(tests: list[dict]) -> dict[str, str]:
+    """Title -> id of the test that owns the offline history for that title: the earliest started one. A copy keeps
+    the title but starts later with no users, so it must not inherit the original's matured revenue."""
+    owners: dict[str, tuple[str, str]] = {}
+    for x in tests:
+        if x.get("state") == "draft":
+            continue
+        key = (x.get("started_at") or "9999", x["ab_test_id"])
+        if x["title"] not in owners or key < owners[x["title"]]:
+            owners[x["title"]] = key
+    return {title: key[1] for title, key in owners.items()}
+
+
+def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements: dict | None = None,
+          owners: dict[str, str] | None = None) -> dict | None:
     arms = arms_of(test)
     code = {v: k for k, v in names.items()}
     base = {"ab_test_id": test["ab_test_id"], "title": test["title"], "state": test["state"], "type": test["type"],
@@ -257,6 +303,10 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                                        "matured revenue yet (an Adapty S3/BigQuery export would add it)")
     if len(arms) < 2:
         return unsupported(base, test, "fewer than two arms")
+    owner = (owners or {}).get(test["title"], test["ab_test_id"])
+    if owner != test["ab_test_id"]:
+        return unsupported(base, test, f"a copy of an earlier test with the same title (id {owner}): the offline "
+                                       "history belongs to that test, and this copy has no matured users of its own")
     e_all = u[u.ab_test == test["title"]]
     if e_all.empty:
         return unsupported(base, test, "no user→arm history for this test (the offline dataset covers the seeded "
@@ -276,12 +326,17 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     win, lose, others = ranked[0], ranked[1], ranked[2:]
     w_rev, l_rev = e[e.user_id.isin(win["_ids"])].revenue.values, e[e.user_id.isin(lose["_ids"])].revenue.values
     lo, hi, p = boot(w_rev, l_rev)
+    seq_p = always_valid_p(w_rev, l_rev)  # valid under the daily re-checks of the dashboard and cron
     gap = win["rev_per_user"] - lose["rev_per_user"]
 
     # health: SRM + randomization balance on the pre-exposure intent score (GrowthBook threshold p < 0.001)
+    # SRM uses the weights as configured now (Adapty keeps no weight history); an arm at weight 0 is switched off,
+    # so it has no expected share and is left out instead of making the expectation 0
     w = np.array([a["weight"] for a in ranked], dtype=float)
     users = np.array([a["users"] for a in ranked])
-    srm_p = float(stats.chisquare(users, w / w.sum() * users.sum()).pvalue)
+    on = w > 0
+    srm_p = (float(stats.chisquare(users[on], w[on] / w[on].sum() * users[on].sum()).pvalue)
+             if on.sum() >= 2 else 1.0)
     bal_p = float(stats.f_oneway(*[e[e.user_id.isin(a["_ids"])].intent_score for a in ranked]).pvalue)
 
     # guardrails: the winner must not raise refunds or billing issues
@@ -326,11 +381,12 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                                         for a in ranked[1:])
     losing_share = sum(a["weight"] for a in ranked[1:]) / total_w
 
-    decided = lo > 0 and p > 0.99
+    decided = lo > 0 and p > 0.99 and seq_p < 0.05
     healthy = srm_p > 0.01 and bal_p > 0.001
     n_needed = sample_size_per_arm(np.concatenate([w_rev, l_rev]))
-    if test["state"] == "completed":
-        verdict = "completed_confirmed" if decided else "completed_inconclusive"
+    if test["state"] == "completed":  # same checks as a live rollout: health, guardrails, segments
+        verdict = ("completed_inconclusive" if not decided else
+                   "completed_check_failed" if not healthy or guard_fail or flipped else "completed_confirmed")
     elif not healthy:
         verdict = "check_data"
     elif decided and guard_fail:
@@ -343,7 +399,7 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
         verdict = "keep_running"
 
     reasons = [f"{win['name']} earns ${win['rev_per_user']:.2f} vs ${lose['rev_per_user']:.2f} per user in "
-               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%})"
+               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%}, always-valid p={seq_p:.2g})"
                + (f"; {len(others)} more arm(s) further behind" if others else ""),
                f"traffic split {'OK' if srm_p > 0.01 else 'BROKEN'} (SRM p={srm_p:.2f}), groups "
                f"{'balanced' if bal_p > 0.001 else 'UNBALANCED'} on intent (p={bal_p:.2f})",
@@ -359,7 +415,7 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     return {**base, "matured_users": int(len(e)), "arms": ranked, "winner": win, "loser": lose, "others": others,
             "losing_share": round(losing_share, 4),
             "lift_pct": round(100 * gap / lose["rev_per_user"], 1) if lose["rev_per_user"] else None,
-            "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4),
+            "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4), "sequential_p": float(f"{seq_p:.3g}"),
             "health": {"srm_pvalue": round(srm_p, 4), "balance_pvalue": round(bal_p, 4), "healthy": healthy},
             "guardrails": {"winner": gw, "other": gl, "refund_p": round(refund_p, 4),
                            "billing_p": round(billing_p, 4), "failed": [n for n, _ in guard_fail]},
@@ -378,9 +434,9 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
     days = (pl.install_at.max() - pl.install_at.min()).days or 1 if not pl.empty else 1
     daily = len(pl) / days * (LIVE_USERS / OFFLINE_USERS) if not pl.empty else 0
     n = sample_size_per_arm(hist.revenue.values) if len(hist) > 30 else None
-    days_needed = int(np.ceil(n * len(arms) / daily)) + base["horizon_days"] if n and daily else None
+    days_needed = int(np.ceil(n * len(arms) / daily)) + base["horizon_days"] if n and daily and arms else None
     # smallest lift detectable with 30 days of enrolment at this traffic (n scales with 1/MDE^2)
-    n30 = daily * 30 / len(arms)
+    n30 = daily * 30 / len(arms) if arms else 0
     mde30 = MDE * np.sqrt(n / n30) if n and n30 else None
     return {**base, "verdict": "draft_plan", "baseline_rev_per_user": round(float(hist.revenue.mean()), 2)
             if len(hist) else None, "sample_size_per_arm": n, "daily_users_at_placement": round(daily, 1),
@@ -406,7 +462,7 @@ def write_atomic(path: Path, text: str) -> None:
 def report_path(app_id: str | None = None) -> Path:
     """out/report.json for the default app, out/report-<app>.json for any other app of the portfolio."""
     app_id = app_id or adapty_cli.DEFAULT_APP_ID
-    return OUT / ("report.json" if app_id == adapty_cli.DEFAULT_APP_ID else f"report-{app_id}.json")
+    return out_dir() / ("report.json" if app_id == adapty_cli.DEFAULT_APP_ID else f"report-{app_id}.json")
 
 
 def build_report(app_id: str | None = None) -> dict:
@@ -429,13 +485,15 @@ def build_report(app_id: str | None = None) -> dict:
             return datasets[h]
 
         names, placements = flow_names(), placement_codes()
-        tests = [x for x in adapty_cli.list_tests() if x["state"] in ("live", "completed", "draft")]
+        all_tests = adapty_cli.list_tests()
+        owners = history_owners(all_tests)
+        tests = [x for x in all_tests if x["state"] in ("live", "completed", "draft")]
         for tst in tests:  # build the per-horizon datasets up front, before running judges in threads
             data_for(horizon_of(tst))
         from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
         with ThreadPoolExecutor(max_workers=4) as pool:  # judges wait on Adapty CLI calls (live view)
             results = list(pool.map(adapty_cli.in_current_app(
-                lambda x: judge(x, *data_for(horizon_of(x)), names, placements)), tests))
+                lambda x: judge(x, *data_for(horizon_of(x)), names, placements, owners)), tests))
         judged = [res for res in results if res is not None]
         m = base_u[base_u.matured]
         bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
@@ -454,7 +512,7 @@ def build_report(app_id: str | None = None) -> dict:
                 "payer_rate_by_intent": {k: round(float(m[m.intent == k].payer.mean() or 0), 3)
                                          for k in ["low", "mid", "high"]}},
         }
-    OUT.mkdir(exist_ok=True)
+    out_dir().mkdir(parents=True, exist_ok=True)
     write_atomic(report_path(app_id), json.dumps(report, indent=2))
     return report
 
@@ -471,6 +529,10 @@ def mark_stopped(app_id: str, test_id: str) -> dict:
     return r
 
 
+def portfolio_path() -> Path:
+    return out_dir() / "portfolio.json"
+
+
 def portfolio() -> list[dict]:
     """One row per app the Adapty account can open: tests, decided live tests, money at stake."""
     rows = []
@@ -480,8 +542,8 @@ def portfolio() -> list[dict]:
         rows.append({"app_id": app["id"], "app": app["title"], "tests": len(r["tests"]), "live": len(live),
                      "decided_live": sum(t["verdict"] == "stop_and_roll_out" for t in live),
                      "lost_per_month_usd": r["total_lost_per_month_usd"], "has_history": r["has_history"]})
-    OUT.mkdir(exist_ok=True)
-    write_atomic(OUT / "portfolio.json", json.dumps(rows, indent=2))
+    out_dir().mkdir(parents=True, exist_ok=True)
+    write_atomic(portfolio_path(), json.dumps(rows, indent=2))
     return rows
 
 

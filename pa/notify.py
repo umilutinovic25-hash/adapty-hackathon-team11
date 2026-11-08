@@ -11,8 +11,16 @@ from pathlib import Path
 
 import requests
 
+from pa import out_dir
+
 DASHBOARD_URL = os.getenv("AUTOPILOT_DASHBOARD_URL", "http://localhost:8501")
-OUT = Path("out/slack_message.json")
+
+
+def lift_text(t: dict) -> str:
+    """'+12.5%', or 'vs $0.00' when the other arm earned nothing (a relative lift is undefined there)."""
+    if t.get("lift_pct") is None:
+        return f"vs ${t['loser']['rev_per_user']:.2f}"
+    return f"{t['lift_pct']:+}%"
 
 
 def digest(report: dict, app_title: str | None = None) -> dict:
@@ -36,7 +44,7 @@ def digest(report: dict, app_title: str | None = None) -> dict:
                 warn = ""
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
                            f"*{t['title']}* · {t['placement']}\n🏆 {t['winner']['name']} "
-                           f"+{t['lift_pct']}% {t['horizon_days']}-day revenue/user "
+                           f"{lift_text(t)} {t['horizon_days']}-day revenue/user "
                            f"(P {t['p_winner_better']:.0%}) · ${t['lost_per_month_usd']:,.0f}/month{warn}"}})
         blocks.append({"type": "actions", "elements": [{"type": "button", "style": "primary",
                        "text": {"type": "plain_text", "text": "Review & approve"},
@@ -45,12 +53,17 @@ def digest(report: dict, app_title: str | None = None) -> dict:
     return {"text": text, "blocks": blocks}
 
 
+def message_path() -> Path:
+    return out_dir() / "slack_message.json"
+
+
 def send(report: dict, app_title: str | None = None) -> dict:
     msg = digest(report, app_title)
-    OUT.parent.mkdir(exist_ok=True)
-    OUT.write_text(json.dumps(msg, indent=2))
+    out = message_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(msg, indent=2))
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
-        return {"sent": False, "preview": str(OUT)}
+        return {"sent": False, "preview": str(out)}
     resp = requests.post(url, json=msg, timeout=10)
     return {"sent": resp.ok, "status": resp.status_code}

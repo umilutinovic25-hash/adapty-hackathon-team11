@@ -62,7 +62,9 @@ approval).
    dashboard.
 2. **Full history**: the offline dataset says which arm every user saw. Net revenue in the first 60 days counts
    trials as $0 and removes refunds, and only users whose 60 days have passed are included.
-3. **Decision**: revenue per user per arm, bootstrap 95% CI, P(winner better).
+3. **Decision**: revenue per user per arm, bootstrap 95% CI, P(winner better), and an always-valid p-value (mixture
+   SPRT), so re-checking the same test every day in the dashboard or a cron doesn't inflate false winners. A completed
+   test is "confirmed" only if the health, guardrail and segment checks pass too.
 4. **Health** (as in GrowthBook): SRM on the traffic split; randomization balance on a pre-exposure intent score.
 5. **Guardrails** (as in GrowthBook/Eppo): refund rate and billing-issue rate **per charge**. A per-payer rate would
    penalise weekly plans for charging more often. P-values come from a bootstrap over **users**, because renewals
@@ -76,7 +78,8 @@ approval).
    Tests with 3+ arms compare the winner with the runner-up and count money on every losing arm. The revenue horizon
    is read from the test goal ("…60-day revenue…"), with 60 days as the default.
 9. **Change Guard**: shows what changes, the audience, who is affected, the expected effect, and that a stop can't be
-   undone. After approval it runs `adapty ab-tests stop <id> --winner <id>` and appends to `out/audit.log`.
+   undone. After approval by a named person it re-judges on fresh data, runs `adapty ab-tests stop <id> --winner <id>`
+   and appends to `out/audit.log`. The CLI and the dashboard share this one path.
 
 ## Run
 
@@ -108,6 +111,10 @@ metrics and the Slack digest.
   export). Without it the tool still shows the live view and the plans.
 - Paywall-type tests are listed as "can't judge on history yet" with what Adapty sees; the offline dataset has flows only.
 - Dollar figures are scaled to Lumen's live size (5k of 50k offline users).
+- SRM uses the arm weights as configured now; Adapty keeps no weight history, so a split changed mid-test can show
+  up as SRM. Arms at weight 0 are left out of the check.
+- The history belongs to the earliest started test with a given title; a later copy is listed with what Adapty sees
+  until it has matured users of its own.
 
 ## Data and AI disclosure
 

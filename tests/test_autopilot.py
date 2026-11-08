@@ -44,6 +44,7 @@ def mocked(monkeypatch, tmp_path):
                         lambda tid, wid, app_id=None: state["stopped"].append((tid, wid)) or state["apps"].append(app_id)
                         or {"ok": True})
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUTOPILOT_OUT_DIR", str(tmp_path / "out"))  # never touch the project's real out/
     return state
 
 
@@ -215,6 +216,95 @@ def test_three_arm_test_compares_winner_with_runner_up(monkeypatch):
     assert res["losing_share"] == pytest.approx(2 / 3, abs=0.01)
 
 
+def _synthetic(means, weights, state="live", n=600, seed=1):
+    import numpy as np
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    rows = []
+    for (code, mean) in means:
+        for i in range(n):
+            rows.append({"user_id": f"{code}{i}", "ab_test": "TS", "flow": code, "matured": True,
+                         "revenue": float(rng.exponential(mean)), "payer": 1, "intent_score": rng.random(),
+                         "intent": "mid", "platform": "iOS", "acquisition_channel": "organic",
+                         "install_at": pd.Timestamp("2026-08-01") + pd.Timedelta(days=i % 60)})
+    u = pd.DataFrame(rows)
+    t = pd.DataFrame({"user_id": u.user_id, "paid": True, "refunded_at": pd.NaT, "billing_issue_detected_at": pd.NaT,
+                      "price_usd": u.revenue, "day": 0.5})
+    test = {"ab_test_id": "ts", "title": "TS", "state": state, "type": "flow", "goal": None, "segment_ids": [],
+            "started_at": None, "placement": {"title": "P", "placement_id": "p"},
+            "flows": [{"flow_name": c.upper(), "flow_id": c.upper(), "weight": w} for (c, _), w in zip(means, weights)]}
+    return test, u, t, {c: c.upper() for c, _ in means}
+
+
+def test_completed_test_is_confirmed_only_if_health_checks_pass(monkeypatch):
+    """Finding 3: a completed test with a broken traffic split must not be labelled 'confirmed'."""
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 4.0), ("b", 10.0)], [90, 10], state="completed")  # equal users, 90/10 split
+    res = experiments.judge(test, u, t, names)
+    assert res["health"]["healthy"] is False
+    assert res["verdict"] == "completed_check_failed"
+
+
+def test_zero_weight_arm_does_not_break_srm(monkeypatch):
+    """Finding 6: an arm at weight 0 (switched off) made the chi-square expectation 0 and the SRM p-value NaN."""
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 4.0), ("b", 10.0), ("c", 5.0)], [50, 50, 0])
+    res = experiments.judge(test, u, t, names)
+    import math
+    assert not math.isnan(res["health"]["srm_pvalue"]) and res["health"]["srm_pvalue"] > 0.01
+    assert res["verdict"] == "stop_and_roll_out"
+
+
+def test_bonferroni_bootstrap_has_enough_draws_in_each_tail():
+    """Finding 5: 1,000 draws at alpha 0.05/10 leave 2.5 draws per tail, so 'reversed'/'unclear' were partly noise."""
+    assert experiments.boot_n(1000, 0.05 / 10) * (0.05 / 10) / 2 >= experiments.MIN_TAIL_DRAWS
+    import numpy as np
+    rng = np.random.default_rng(3)
+    a, b = rng.exponential(5, 400), rng.exponential(4, 400)
+    lo1, hi1, _ = experiments.boot(a, b, 1000, alpha=0.005)
+    lo2, hi2, _ = experiments.boot(a, b, 1000, alpha=0.005, seed=99)
+    assert abs(lo1 - lo2) < 0.15 and abs(hi1 - hi2) < 0.15  # bounds no longer move with the random seed
+
+
+def test_intent_model_trains_only_on_matured_users(monkeypatch):
+    """Finding 9: a user installed 10 days ago can't be a 60-day payer yet; training on them teaches the model
+    'recent install = low intent', so intent groups partly measure user age."""
+    import numpy as np
+    import pandas as pd
+    from sklearn.dummy import DummyClassifier
+    seen = []
+
+    class Spy(DummyClassifier):
+        def fit(self, X, y):
+            seen.append(X.index)
+            return super().fit(X, y)
+    monkeypatch.setattr(experiments, "build_model", lambda: Spy(strategy="prior"))
+    n = 400
+    u = pd.DataFrame({c: "x" for c in experiments.CAT} | {c: 1.0 for c in experiments.NUM}, index=range(n))
+    u["matured"] = np.arange(n) % 2 == 0
+    u["payer"] = np.arange(n) % 4 == 0
+    out = experiments.add_intent(u)
+    assert seen and all(u.loc[idx].matured.all() for idx in seen)
+    assert out.intent_score.notna().all()  # everyone is still scored
+
+
+def test_repeated_checks_need_an_always_valid_p_value(monkeypatch):
+    """Finding 4: the dashboard and cron re-check a test daily. A gap that a single fixed-horizon look calls decided
+    (CI excludes 0, P(better) > 99%) but that the always-valid p-value doesn't support must keep running."""
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 5.0), ("b", 5.6)], [50, 50], n=2000, seed=1)
+    res = experiments.judge(test, u, t, names)
+    assert res["diff_ci95"][0] > 0 and res["p_winner_better"] > 0.99  # the old rule would stop this test
+    assert res["sequential_p"] > 0.05 and res["verdict"] == "keep_running"
+
+
+def test_draft_without_arms_does_not_crash(mocked):
+    draft = next(x for x in mocked["tests"] if x["state"] == "draft")
+    draft["flows"], draft["paywalls"] = [], []
+    d = next(t for t in experiments.build_report()["tests"] if t["state"] == "draft")
+    assert d["verdict"] == "draft_plan" and d["days_to_decision"] is None
+
+
 def test_horizon_comes_from_the_test_goal():
     assert experiments.horizon_of({"goal": "maximise 30-day revenue per install"}) == 30
     assert experiments.horizon_of({"goal": "no horizon here"}) == experiments.HORIZON_DAYS
@@ -331,3 +421,92 @@ def test_throttled_cli_calls_are_retried_after_the_wait_adapty_asks_for(monkeypa
 
 def test_cli_concurrency_is_capped():
     assert adapty_cli.MAX_CONCURRENT_CALLS <= 3
+
+
+# ---------------------------------------------------------------- review round 5 (written before the fixes)
+def test_copy_of_a_test_does_not_inherit_the_original_history(mocked):
+    """Finding 1: a copy keeps the title; history must stay with the original, or a copy with zero users is
+    judged 'stop & roll out' and offered for an irreversible stop."""
+    orig = next(x for x in mocked["tests"] if x["title"] == ONB)
+    orig["state"] = "completed"
+    copy_ = copy.deepcopy(orig)
+    copy_.update(ab_test_id="copy-1", state="live", started_at="2026-11-07T10:00:00Z")
+    mocked["tests"].append(copy_)
+    r = experiments.build_report()
+    got = {t["ab_test_id"]: t for t in r["tests"]}
+    assert got["copy-1"]["verdict"] == "unsupported"
+    assert got[orig["ab_test_id"]]["verdict"] == "completed_confirmed"
+    assert r["total_lost_per_month_usd"] == pytest.approx(353.63, abs=1)  # only Main is still decided
+
+
+def test_successful_stop_with_non_json_output_is_still_a_success(monkeypatch):
+    """Finding 2: exit code 0 means Adapty stopped the test; odd stdout must not turn that into an error that skips
+    the audit log and leaves the Stop button on the card."""
+    import subprocess as sp
+    monkeypatch.setattr(adapty_cli.subprocess, "run",
+                        lambda cmd, **kw: sp.CompletedProcess(cmd, 0, "✔ A/B test stopped\n", ""))
+    res = adapty_cli.stop_test("t1", "w1", app_id="a1")
+    assert res["ok"] is True and "stopped" in res["raw"]
+
+
+def _main_winner():
+    main_test = next(x for x in TESTS if x["title"] == MAIN)
+    return main_test["ab_test_id"], next(a["flow_id"] for a in main_test["flows"]
+                                         if a["flow_name"] == "Main - Lifetime anchor")
+
+
+def test_cli_stop_refreshes_the_saved_report(mocked, monkeypatch):
+    """Finding 7: after a CLI stop the saved report must show the test as completed, like the dashboard does."""
+    tid, winner = _main_winner()
+    monkeypatch.setattr("sys.argv", ["pa.cli", "stop", tid, "--winner-id", winner, "--approved-by", "tester"])
+    cli.main()
+    saved = {t["ab_test_id"]: t for t in json.loads(Path("out/report.json").read_text())["tests"]}
+    assert saved[tid]["state"] == "completed" and saved[tid]["verdict"] == "completed_confirmed"
+
+
+def test_one_stop_path_needs_a_named_approver(mocked):
+    tid, winner = _main_winner()
+    with pytest.raises(cli.StopRefused, match="approver"):
+        cli.execute_stop(tid, winner, approved_by="  ")
+    assert mocked["stopped"] == []
+
+
+def test_audit_is_written_even_if_the_report_update_fails(mocked, monkeypatch):
+    tid, winner = _main_winner()
+    def boom(*a):
+        raise OSError("disk full")
+    monkeypatch.setattr(cli, "mark_stopped", boom)
+    with pytest.raises(OSError):
+        cli.execute_stop(tid, winner, approved_by="Uroš")
+    entry = json.loads(Path("out/audit.log").read_text().splitlines()[-1])
+    assert entry["approved_by"] == "Uroš" and mocked["stopped"] == [(tid, winner)]
+
+
+def test_outputs_do_not_depend_on_the_working_directory(monkeypatch, tmp_path):
+    """Finding 8: a cron job started from another folder must write the same out/ the dashboard reads."""
+    import pa
+    from pa import notify
+    monkeypatch.delenv("AUTOPILOT_OUT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    root_out = pa.ROOT / "out"
+    assert experiments.report_path() == root_out / "report.json"
+    assert cli.audit_path() == root_out / "audit.log"
+    assert notify.message_path() == root_out / "slack_message.json"
+
+
+def test_lift_against_a_zero_revenue_arm_never_prints_none(mocked):
+    """Finding 10: '+None%' in Slack and the dashboard when the other arm earned $0."""
+    from pa import notify
+    r = experiments.build_report()
+    for t in r["tests"]:
+        if t["title"] == MAIN:
+            t["lift_pct"], t["loser"]["rev_per_user"] = None, 0.0
+    assert "None" not in json.dumps(notify.digest(r, "Lumen"))
+    assert notify.lift_text({"lift_pct": None, "loser": {"rev_per_user": 0.0}}) == "vs $0.00"
+    assert notify.lift_text({"lift_pct": 12.5, "loser": {"rev_per_user": 1.0}}) == "+12.5%"
+    assert "lift_pct']}%" not in (Path(__file__).parents[1] / "app.py").read_text()
+
+
+def test_dashboard_uses_the_shared_stop_path():
+    src = (Path(__file__).parents[1] / "app.py").read_text()
+    assert "execute_stop(" in src and "adapty_cli.stop_test(" not in src
