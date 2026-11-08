@@ -143,7 +143,7 @@ offline history. Leave the main Lumen tests live for the demo.
 refuses if the verdict changed or the fresh winner differs from the approved one, then writes the audit log. The
 dashboard's Stop button applies the same fresh re-check.
 
-Tests: `uv run pytest -q` runs **124 behaviour tests**, including dashboard rendering, with the Adapty CLI mocked
+Tests: `uv run pytest -q` runs **132 behaviour tests** (+6 slow calibration), including dashboard rendering, with the Adapty CLI mocked
 from fixtures. They cover the post-stop state, fresh-winner and health refusals, applied-winner confirmation,
 multi-arm outliers and safety checks, weighted draft sizing, source/freshness labels, auditable loss intervals,
 other apps without local history files, concurrent report writes, degenerate sequential models, read timeouts,

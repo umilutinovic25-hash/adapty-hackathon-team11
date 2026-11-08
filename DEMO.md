@@ -15,7 +15,7 @@
   `claude -p "Are my Adapty A/B tests decided? What do they cost me? Use the experiment-autopilot skill. Read only: do not stop anything." --allowedTools "Bash(uv run python -m pa.cli check*)" "Skill" "Read"`
   It takes ≈60 s, so **start it at 0:30**, while you talk, and show the answer at 4:15.
 - Numbers for Q&A: `QA.md`.
-- Validation: **124 tests** (`uv run pytest -q`); `bash .claude/verify.sh` also checks the live API and accepts
+- Validation: **132 tests** (`uv run pytest -q`; +6 slow calibration); `bash .claude/verify.sh` also checks the live API and accepts
   `completed_confirmed` after a successful stop.
 
 | Time | Screen | Say (approximately) |
