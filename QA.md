@@ -51,6 +51,12 @@ bootstrap CI, SRM and balance checks, guardrails per charge with a user-level bo
 **What if the data changes between plan and click?** Stop re-judges on fresh Adapty data and refuses if the verdict or
 the winner changed. Every stop is written to an audit log with app, test, winner and approver.
 
+**Can you demonstrate a refused stop?** Run
+`uv run pytest -q tests/test_autopilot.py -k fresh_rejudge_refuses_stop`.
+Two fixture-only cases approve an initial plan, then re-judge with a different winner or a failed traffic-split
+health check. Both raise `StopRefused` before the stop adapter is called, with no success audit entry. The test
+does not call Adapty, change a real app, or require a recording.
+
 **Does it work on a real app?** The live view, plans and actions already use the real Adapty API. Full-history
 judgement needs user→arm history, which in production comes from Adapty's S3/BigQuery export in place of our CSV.
 Apps without it are shown as "can't judge on history yet", never guessed.

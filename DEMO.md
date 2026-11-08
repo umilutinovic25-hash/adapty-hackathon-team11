@@ -25,11 +25,21 @@
 | 2:15–3:00 | Onboarding card → ⏱️ warning + *Revenue maturity* | "Onboarding: Weekly wins on matured revenue too, +90%. Our maturity check shows why the dashboard looked so sure: by day 1 Weekly has 46% of its revenue and Annual trial 0%. Here the early read happened to be right. In another app the same bias picks the wrong winner." |
 | 3:00–3:15 | Segments expander | "Is one winner right for everyone? Our intent model checks low, mid and high purchase intent, plus platform and channel: no segment reverses. One winner for everyone." |
 | 3:15–3:30 | Hero number + summary table | "Together: **≈$1,749 a month**, 28% of today's MRR. Bonus: the completed Settings test isn't significant, and the AI-limit draft would need ~1,500 days at this traffic. Don't start it as designed." |
-| 3:30–4:15 | Main card → Change Guard → tick → **Stop** (≈12 s fresh re-check) → Adapty refresh | "Nothing ships without a human: what changes, who's affected, dollar effect, can't be undone. I approve. *(click)* It re-checks on fresh data first, so a stale plan can't ship. … *(card turns to completed; dashboard)* Winner rolled out, and it's in the audit log." |
+| 3:30–3:40 | Terminal: refused-stop regression test | "First, a stale approval: the fresh winner changes, or the traffic split fails. Change Guard refuses before the stop adapter is called. This runs entirely on fixtures; it sends nothing to Adapty." |
+| 3:40–4:15 | Main card → Change Guard → tick → **Stop** (≈12 s fresh re-check) → Adapty refresh | "Nothing ships without a human: what changes, who's affected, dollar effect, can't be undone. I approve. *(click)* It re-checks on fresh data first, so a stale plan can't ship. … *(card turns to completed; dashboard)* Winner rolled out, and it's in the audit log." |
 | 4:15–4:40 | Terminal: Claude Code answer | "The same brain works as an agent. I asked Claude Code in plain English whether my tests are decided. It answers with these numbers, flags the immature read, and offers to stop a test only after an explicit yes." |
 | 4:40–5:00 | Slide 2 | "Business: it belongs inside Adapty next to Autopilot. Autopilot proposes the next test, we close the running ones, daily via Slack and across a whole portfolio. Who: growth teams. What changes: money and risk." |
 
 ## Likely jury questions
+
+For the refused-stop beat, run this before presenting and leave the result visible in a terminal tab:
+
+```bash
+uv run pytest -q tests/test_autopilot.py -k fresh_rejudge_refuses_stop
+```
+
+Both cases first create an approvable plan, then run the real judge on changed fixture data. They assert that
+the stop adapter is never called and no success audit entry is created. No recording or Adapty API call is needed.
 
 - **Why does this need Adapty?** It reads Adapty's tests, arms, weights, audiences and analytics, and acts through Adapty's CLI. The gap it fills follows from how Adapty attributes test results.
 - **Isn't this Autopilot / the A/B page?** Autopilot proposes *what to test next*. The A/B page shows P2BB since the test started. We judge *running* tests on matured revenue, add health checks and guardrails, and stop them safely. These are complements.

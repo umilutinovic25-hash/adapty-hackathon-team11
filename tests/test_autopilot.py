@@ -703,3 +703,37 @@ def test_dashboard_exposes_the_headline_calculation(mocked, monkeypatch):
     assert "5,000 / 50,000 = 0.1" in text
     assert "daily users" in text and "losing arm share" in text and "revenue gap" in text
     assert all(value in text for value in ["$1,395.68", "$353.63", "$1,749.31", "95%", "new cohorts"])
+
+
+@pytest.mark.parametrize("change", ["winner", "health"])
+def test_fresh_rejudge_refuses_stop_without_calling_adapty(mocked, monkeypatch, data, change):
+    u, tx = data
+    fresh_u = u.copy()
+    monkeypatch.setattr(experiments, "load", lambda horizon=60: (fresh_u.copy(), tx.copy(), tx.purchased_at.max()))
+    monkeypatch.setattr(experiments, "add_intent", lambda frame: frame)  # keep the existing cross-fitted scores
+    approved = experiments.build_report()
+    tid, _ = _main_winner()
+    plan = cli.make_plan(approved, tid)
+    if change == "winner":
+        in_test = fresh_u.ab_test.eq(MAIN)
+        fresh_u.loc[in_test, "flow"] = fresh_u.loc[in_test, "flow"].map({"main": "main_lifetime", "main_lifetime": "main"})
+    else:
+        main = next(t for t in mocked["tests"] if t["title"] == MAIN)
+        main["flows"][0]["weight"], main["flows"][1]["weight"] = 90, 10
+    reads = []
+    original_report = cli.report
+    def observe_report(fresh, app_id=None):
+        reads.append(fresh)
+        return original_report(fresh, app_id)
+    monkeypatch.setattr(cli, "report", observe_report)
+    message = "not the approved winner" if change == "winner" else "verdict is check_data"
+    with pytest.raises(cli.StopRefused, match=message):
+        cli.execute_stop(tid, plan["winner_id"], approved_by="tester", app_id=adapty_cli.DEFAULT_APP_ID)
+    assert reads == [True]
+    assert mocked["stopped"] == [] and mocked["apps"] == []
+    assert not cli.audit_path().exists()
+    fresh = by_title(original_report(fresh=False))[MAIN]
+    if change == "winner":
+        assert fresh["verdict"] == "stop_and_roll_out" and fresh["winner"]["content_id"] != plan["winner_id"]
+    else:
+        assert fresh["health"]["healthy"] is False and fresh["verdict"] == "check_data"
