@@ -649,6 +649,24 @@ def test_dashboard_saved_report_has_source_dates_and_age(mocked, monkeypatch, le
     assert "Adapty API (live)" not in captions
 
 
+def test_dashboard_recent_saved_report_is_not_called_offline(mocked, monkeypatch):
+    """Demo flow: `pa.cli check` a few minutes before `streamlit run` must not look offline on stage."""
+    from datetime import datetime, timedelta, timezone
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    r = experiments.build_report()
+    r["analyzed_at"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    experiments.write_atomic(experiments.report_path(), json.dumps(r))
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"}])
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    assert not ui.exception
+    assert not any("saved report" in w.value for w in ui.warning)
+    captions = " ".join(c.value for c in ui.caption)
+    assert "Adapty API, read 5 min ago" in captions
+    assert "offline" not in captions.replace("Default app (offline)", "")
+
+
 def test_dashboard_live_badge_requires_a_fresh_analysis(mocked, monkeypatch):
     from streamlit.testing.v1 import AppTest
     import streamlit as st

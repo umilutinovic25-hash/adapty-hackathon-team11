@@ -67,7 +67,7 @@ the CLI and dashboard. [Exact commands and paths](README.md#seed-a-rehearsal-app
 is needed; the matured analysis uses the synthetic history. Keep the main Lumen tests live for the demo.
 
 **What did you build during the hackathon?** All of it: analysis, dashboard, agent CLI, Claude Code skill, Slack
-digest, **66 tests**. Pre-existing: open-source libraries only. AI tools: Claude Code, disclosed in the README.
+digest, **67 tests**. Pre-existing: open-source libraries only. AI tools: Claude Code, disclosed in the README.
 
 **What's next?** S3/BigQuery history, a daily Slack digest with an approve link, and a home inside Adapty next to
 Autopilot.

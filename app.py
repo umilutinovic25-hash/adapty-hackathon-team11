@@ -110,13 +110,21 @@ if not REPORT.exists():
     st.error("No analysis yet and Adapty is unreachable. Connect and press Re-run.")
     st.stop()
 r = load_report(str(REPORT), report_mtime(REPORT))
-api_source = "Adapty API (live)" if fresh_analysis else "saved report (offline)"
 analyzed_at = pd.to_datetime(r.get("analyzed_at"), utc=True, errors="coerce")
 if pd.isna(analyzed_at):
     analyzed_at = None
 analysis_label = (analyzed_at.strftime("%Y-%m-%d %H:%M:%S UTC") if analyzed_at is not None else "unknown")
 history_label = str(r.get("data_end", "unknown"))[:10] if r.get("has_history", True) else "no history for this app"
-if not fresh_analysis:
+# a report read from Adapty within the last hour (e.g. `pa.cli check` just before the demo) counts as live
+age_min = ((pd.Timestamp.now(tz="UTC") - analyzed_at).total_seconds() / 60) if analyzed_at is not None else None
+recent = age_min is not None and age_min < 60
+if fresh_analysis:
+    api_source = "Adapty API (live)"
+elif recent:
+    api_source = f"Adapty API, read {max(0, round(age_min))} min ago"
+else:
+    api_source = "saved report (offline)"
+if not fresh_analysis and not recent:
     age_from = analyzed_at if analyzed_at is not None else pd.Timestamp(report_mtime(REPORT), unit="ns", tz="UTC")
     age_hours = max(0, (pd.Timestamp.now(tz="UTC") - age_from).total_seconds() / 3600)
     age_note = "analysis time unknown; file age" if analyzed_at is None else "analysis age"

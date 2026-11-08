@@ -90,8 +90,9 @@ approval).
    and appends to `out/audit.log`. The CLI and the dashboard share this one path.
 
 The dashboard labels **Adapty API (live)**, **synthetic history**, and **saved report (offline)** by section, with
-the UTC analysis time and last date covered by history. Opening a saved report shows its age; re-run analysis to
-refresh it. The hero expander retains the unrounded traffic inputs, the 5k/50k scaling, per-arm revenue gaps and
+the UTC analysis time and last date covered by history. A report read from Adapty within the last hour (e.g. by
+`pa.cli check` before the demo) shows as **Adapty API, read N min ago**; an older one shows its age as a warning; re-run
+analysis to refresh it. The hero expander retains the unrounded traffic inputs, the 5k/50k scaling, per-arm revenue gaps and
 two-arm 95% monthly loss intervals. These estimate the revenue of new cohorts over the test horizon, not MRR.
 
 ## Run
