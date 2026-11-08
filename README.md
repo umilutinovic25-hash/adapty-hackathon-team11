@@ -13,7 +13,9 @@
 - A completed test was **not significant** on the full history, and a draft would need **≈1,545 days** at this
   traffic.
 - One approved click stops a decided test in Adapty: the plan is re-checked on fresh data and written to an audit log.
-  [See the full stop flow (GIF)](docs/stop-flow.gif), recorded on a rehearsal copy of the app.
+- Read-only online version for the jury: https://claude.ai/artifact/6cBq6iQkhck8NfCxKoBQhk
+
+![An approved stop, recorded on a rehearsal copy of the app](docs/stop-flow.gif)
 
 Adapty's A/B page judges a test from the day it starts. Early on, part of the revenue hasn't happened yet: an
 annual plan with a 7-day trial pays nothing in week one, a weekly plan pays on day one. Experiment Autopilot judges
