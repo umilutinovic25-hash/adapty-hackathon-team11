@@ -60,16 +60,21 @@ approval).
    audience` gives the live view: users, revenue, trials and **finished** trials per arm since the test started,
    counting only users inside the test, because the same flow can also be shown outside it. The numbers match the
    dashboard.
-2. **Full history**: the offline dataset says which arm every user saw. Net revenue in the first 60 days counts
-   trials as $0 and removes refunds, and only users whose 60 days have passed are included.
-3. **Decision**: revenue per user per arm, bootstrap 95% CI, P(winner better), and an always-valid p-value (mixture
-   SPRT), so re-checking the same test every day in the dashboard or a cron doesn't inflate false winners. A completed
+2. **Full history**: exposure history identifies the test with `ab_test_id` and starts each user's revenue and
+   maturity clock at `exposed_at`. Purchases before exposure are excluded. The synthetic demo CSVs lack exposure
+   timestamps and retain an explicitly labeled installation-time proxy. Only matured users are compared.
+3. **Decision**: revenue per user per arm, a descriptive bootstrap 95% CI and bootstrap P(better), plus a
+   time-uniform betting confidence sequence per arm for actual exposure history with predeclared revenue bounds.
+   It covers repeated looks and splits the error across every arm. Missing bounds or values outside them require review; they
+   cannot authorize rollout. The legacy synthetic demo retains its normal-mixture approximation and is labeled
+   as not validated for real decisions. Bootstrap P(better) is a resampling fraction, not a Bayesian posterior. A completed
    test is `completed_confirmed` only if all comparisons and health, guardrail and segment checks pass, and the
    known applied winner matches the history winner. Verified history that favours another applied arm gives
    `completed_disagrees`; missing applied-winner metadata gives `completed_winner_unknown`. Neither confirms the
    rollout. Insufficient revenue evidence gives `completed_inconclusive`; failed safety checks on an otherwise
-   decided completed test give `completed_check_failed`.
-4. **Health** (as in GrowthBook): SRM on the traffic split; randomization balance on a pre-exposure intent score.
+   decided completed test, or an inapplicable sequential model, give `completed_check_failed`.
+4. **Health** (as in GrowthBook): SRM on the traffic split and intent-score balance. Interpreting intent balance as
+   a randomization check requires features collected before exposure; day-one signals are not automatically pre-exposure.
 5. **Guardrails** (as in GrowthBook/Eppo): refund rate and billing-issue rate **per charge**. A per-payer rate would
    penalise weekly plans for charging more often. P-values come from a bootstrap over **users**, because renewals
    of one user are correlated.
@@ -81,7 +86,7 @@ approval).
    only the traffic of the draft's own placement and its smallest configured arm share. Enrolment days are
    `n / (daily users × smallest share)`, plus the revenue window; the 30-day MDE uses the same share. Missing history,
    insufficient matured users, or no usable traffic/allocation gives **can't size**, never a recommendation to start.
-   Tests with 3+ arms compare the winner with **every** losing arm: bootstrap CI, always-valid p, guardrails and
+   Tests with 3+ arms compare the winner with **every** losing arm: bootstrap CI, sequential revenue check, guardrails and
    segments must pass for each comparison before rollout. An unverified revenue comparison leaves `keep_running`;
    failed health/guardrail/segment checks retain their non-actionable verdicts. Money counts only verified losing
    arms. The revenue horizon is read from the test goal ("…60-day revenue…"), with 60 days as the default.
@@ -138,18 +143,79 @@ offline history. Leave the main Lumen tests live for the demo.
 refuses if the verdict changed or the fresh winner differs from the approved one, then writes the audit log. The
 dashboard's Stop button applies the same fresh re-check.
 
-Tests: `uv run pytest -q` runs **66 behaviour tests**, including dashboard rendering, with the Adapty CLI mocked
+Tests: `uv run pytest -q` runs **124 behaviour tests**, including dashboard rendering, with the Adapty CLI mocked
 from fixtures. They cover the post-stop state, fresh-winner and health refusals, applied-winner confirmation,
 multi-arm outliers and safety checks, weighted draft sizing, source/freshness labels, auditable loss intervals,
-other apps without history, test-only live metrics and the Slack digest.
+other apps without local history files, concurrent report writes, degenerate sequential models, read timeouts,
+test-only live metrics and the Slack digest. A refused dashboard approval refreshes the card immediately and
+requires a new approval.
+
+### Exposure history and statistical validation
+
+In addition to existing user fields, actual experiment history needs `ab_test_id` and a valid UTC `exposed_at`
+for every input user. The current flat input is one exposure per user; duplicate user IDs are rejected during
+transaction joining. Test IDs take precedence over titles, and exposures preceding the test's `started_at` are
+excluded. Include all exposed users, including users with no purchases. An export adapter and reconciliation of
+variant revisions are still required before connecting a real warehouse.
+
+`load(horizon, observed_through=...)` accepts an authoritative snapshot cutoff; without it the last purchase is
+used as a conservative fallback. Future transactions/refunds are excluded at an explicit cutoff. In exposure
+history, refunds and billing events after the user's horizon cannot rewrite an already matured observation.
+Missing or invalid explicit exposures never fall back to installation dates.
+
+Predeclare **total horizon revenue per exposed user** bounds before inspecting outcomes, including zero-paying
+users. These are not transaction-price bounds or observed sample minima/maxima. They must hold for the whole
+population; values outside the declared range cause review, never clipping. The Python entry point supports a
+protocol per test and an observation cutoff, for example:
+
+```python
+build_report(app_id="YOUR_APP_ID", revenue_bounds_usd={"TEST_UUID": [0, 1000]},
+             observed_through="2026-11-08T00:00:00Z")
+```
+
+The numbers above are examples, not validated bounds for another app. The existing `OFFLINE_APP_IDS` mapping
+must associate the configured history with that app. Fresh Change Guard rebuilds retain the declared bounds
+from the saved report only for the same test ID and horizon. Exposure-history traffic uses actual observed
+enrollment with scale 1; demo history retains its 5k/50k scaling and cent-rounded revenue calculation.
+
+Each arm's revenue, rescaled to [0, 1] by the declared bounds and taken in exposure order, gets a betting
+confidence sequence ([Waudby-Smith & Ramdas, JRSS-B 2024](https://doi.org/10.1093/jrsssb/qkad009)): a hedged
+capital process with predictable plug-in bets that adapt to the observed variance. By Ville's inequality the
+probability that any look's interval misses the arm mean is at most α/k for k arms, so every pairwise difference,
+every look and the data-driven choice of winner hold jointly at 95%. Matured users form a prefix of the exposure
+order, so each look sees a prefix of the same sequence. Intervals are computed on a 1,001-point grid and widened
+by one grid step per side. The reported p is k times the smallest per-arm level at which the two intervals
+separate; p < 0.05 exactly when the anytime interval excludes zero. This assumes independent users, stable arm
+means, fixed bounds, correct assignments and complete, fixed-horizon outcomes.
+
+Unlike the earlier Hoeffding union bound (kept as `bounded_revenue_check` for reference), this does not pay the
+full declared range at every look. Example: $7.95 vs $4.18 per user, 7,000 users per arm, $0–200 bound gives a
+betting interval of $2.60…$5.40 against Hoeffding's -$11.18…$18.71. With 1,000 users per arm, a gap of a few
+dollars may still remain undecided; the method stays conservative when large purchases are allowed.
+
+Run `uv run pytest -q -s -m slow` (excluded from the default suite and pre-commit check, ~90 s) for six seeded simulations: equal means with ordinary,
+zero-inflated and rare-large-purchase revenue; unequal allocation; three arms; and a large known positive effect.
+Each uses 300 repetitions and ten looks. Calibration is empirical evidence for these cases, not a substitute
+for the mathematical assumptions or a real-data pilot. Sample-size planning remains a normal approximation;
+it does not certify the runtime or power of the anytime test.
 
 ## Limits
 
 - Full-history judgement needs the user→arm history (here the offline dataset; in production an Adapty S3/BigQuery
   export). Without it the tool still shows the live view and the plans.
 - Paywall-type tests are listed as "can't judge on history yet" with what Adapty sees; the offline dataset has flows only.
-- Dollar figures are scaled to Lumen's live size (5k of 50k offline users).
-- Monthly loss intervals scale the existing two-arm revenue-gap bootstrap with traffic and allocation held fixed;
+- Synthetic dollar figures are scaled to Lumen's live size (5k of 50k offline users); actual exposure history
+  uses its observed traffic without that scaling. Future traffic uncertainty and business profit are not established.
+- Winner ranking and bootstrap intervals use raw revenue. Synthetic demo point estimates retain per-arm revenue/user
+  rounded to cents to preserve the documented demo. Exposure-history estimates retain raw revenue until final currency
+  formatting. Relative lifts against zero or negative revenue are shown as dollar comparisons.
+- The legacy demo's normal approximation needs positive variance and a positive pooled revenue scale. Otherwise its
+  p-value is `null` and rollout requires review (`check_data` or `completed_check_failed`). This approximation has
+  no general false-positive guarantee. Actual exposure history uses the bounded method described above.
+- Read commands have a 30-second timeout per CLI subprocess. A failed dashboard refresh keeps the last saved
+  analysis and shows a warning.
+- Monthly loss intervals scale the two-arm revenue-gap interval (anytime for exposure history, bootstrap for demo)
+  with traffic and allocation held fixed;
   they exclude traffic uncertainty. There is no aggregate multi-arm interval. The estimate is expected revenue of
   new cohorts over the horizon, not MRR.
 - A history winner cannot establish which arm was applied. If the API omits applied-winner metadata, a completed
@@ -160,12 +226,15 @@ other apps without history, test-only live metrics and the Slack digest.
   rollout does not prove a positive lift in every small segment.
 - SRM uses the arm weights as configured now; Adapty keeps no weight history, so a split changed mid-test can show
   up as SRM. Arms at weight 0 are left out of the check.
-- The history belongs to the earliest started test with a given title; a later copy is listed with what Adapty sees
-  until it has matured users of its own.
+- Legacy title-only history belongs to the earliest started test with that title. Actual exposure history uses
+  the test ID and start time, so a rename cannot discard valid evidence and a copy cannot borrow another test's users.
+- Passing guardrails means no significant worsening was detected; it does not establish a predeclared non-inferiority
+  margin. AI intent segmentation's added decision value and actual financial gains still need independent validation.
 
 ## Data and AI disclosure
 
 - Only the synthetic Lumen demo data from `kpotehin/adapty-seed-data-hack`. No real user data.
-- All code was written during the hackathon with Claude Code (Opus 5.5) as a pair programmer. Pre-existing: open-source
-  libraries only (pandas, scikit-learn, scipy, streamlit, altair). The health-check patterns follow public
+- Built during the hackathon with Claude Code (Opus 5.5) as a pair programmer; Codex assisted with independent review,
+  fixes and regression tests. Pre-existing: open-source libraries only (pandas, scikit-learn, scipy, streamlit, altair).
+  The health-check patterns follow public
   GrowthBook/Statsig/Eppo documentation; no code was copied.

@@ -289,9 +289,8 @@ def test_intent_model_trains_only_on_matured_users(monkeypatch):
     assert out.intent_score.notna().all()  # everyone is still scored
 
 
-def test_repeated_checks_need_an_always_valid_p_value(monkeypatch):
-    """Finding 4: the dashboard and cron re-check a test daily. A gap that a single fixed-horizon look calls decided
-    (CI excludes 0, P(better) > 99%) but that the always-valid p-value doesn't support must keep running."""
+def test_demo_retains_its_normal_approximation_gate(monkeypatch):
+    """Compatibility check for the synthetic demo, not certification of the approximation's error rate."""
     monkeypatch.setattr(adapty_cli, "run", fake_run)
     test, u, t, names = _synthetic([("a", 5.0), ("b", 5.6)], [50, 50], n=2000, seed=1)
     res = experiments.judge(test, u, t, names)
@@ -420,8 +419,55 @@ def test_throttled_cli_calls_are_retried_after_the_wait_adapty_asks_for(monkeypa
     assert len(calls) == 2 and waits and waits[0] >= 1
 
 
-def test_cli_concurrency_is_capped():
+def test_cli_concurrency_is_capped(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import subprocess as sp
+    import threading
     assert adapty_cli.MAX_CONCURRENT_CALLS <= 3
+    workers = adapty_cli.MAX_CONCURRENT_CALLS + 3
+    slots = adapty_cli._slots
+    lock = threading.Lock()
+    attempted, at_capacity, release = threading.Event(), threading.Event(), threading.Event()
+    attempts = active = peak = 0
+
+    class ObservedSlots:
+        def __enter__(self):
+            nonlocal attempts
+            with lock:
+                attempts += 1
+                if attempts == workers:
+                    attempted.set()
+            return slots.__enter__()
+
+        def __exit__(self, *args):
+            return slots.__exit__(*args)
+
+    def fake_run(cmd, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == adapty_cli.MAX_CONCURRENT_CALLS:
+                at_capacity.set()
+        try:
+            assert release.wait(timeout=5)
+            return sp.CompletedProcess(cmd, 0, '{"data": []}', "")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(adapty_cli, "_slots", ObservedSlots())
+    monkeypatch.setattr(adapty_cli.subprocess, "run", fake_run)
+    with ThreadPoolExecutor(workers) as pool:
+        calls = [pool.submit(adapty_cli.run, "ab-tests", "list") for _ in range(workers)]
+        try:
+            assert attempted.wait(timeout=3), "each call must pass through the concurrency limiter"
+            assert at_capacity.wait(timeout=3)
+            assert peak == adapty_cli.MAX_CONCURRENT_CALLS
+        finally:
+            release.set()
+        assert all(call.result(timeout=5) == {"data": []} for call in calls)
+    assert peak <= adapty_cli.MAX_CONCURRENT_CALLS
 
 
 # ---------------------------------------------------------------- review round 5 (written before the fixes)
@@ -721,6 +767,15 @@ def test_dashboard_exposes_the_headline_calculation(mocked, monkeypatch):
     assert "5,000 / 50,000 = 0.1" in text
     assert "daily users" in text and "losing arm share" in text and "revenue gap" in text
     assert all(value in text for value in ["$1,395.68", "$353.63", "$1,749.31", "95%", "new cohorts"])
+    hero = next(m.value for m in ui.markdown if "font-size:56px" in m.value)
+    assert "$1,749.31" in hero
+    table = ui.dataframe[0].value.set_index("test")
+    assert table.loc[MAIN, "$ / month"] == "$353.63"
+    assert table.loc[ONB, "$ / month"] == "$1,395.68"
+    digest = next(e for e in ui.expander if e.label == "📬 Daily digest for Slack")
+    assert "$1,749.31" in " ".join(m.value for m in digest.markdown)
+    assert len([s for s in ui.success if "**Matured 60-day revenue" in s.value]) == 2
+    assert not any("one winner for everyone is the right call" in c.value for c in ui.caption)
 
 
 @pytest.mark.parametrize("change", ["winner", "health"])
@@ -755,3 +810,676 @@ def test_fresh_rejudge_refuses_stop_without_calling_adapty(mocked, monkeypatch, 
         assert fresh["verdict"] == "stop_and_roll_out" and fresh["winner"]["content_id"] != plan["winner_id"]
     else:
         assert fresh["health"]["healthy"] is False and fresh["verdict"] == "check_data"
+
+
+@pytest.mark.parametrize("change", ["winner", "health"])
+def test_dashboard_refusal_refreshes_the_card_and_requires_new_approval(mocked, monkeypatch, change):
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    r = experiments.build_report()
+    tid, _ = _main_winner()
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": r["app_id"], "title": "Lumen"}])
+
+    def refuse(*args, **kwargs):
+        fresh = copy.deepcopy(r)
+        main = by_title(fresh)[MAIN]
+        if change == "health":
+            main["verdict"] = "check_data"
+            main["health"]["healthy"] = False
+        else:
+            main["winner"], main["loser"] = main["loser"], main["winner"]
+        fresh["total_lost_per_month_usd"] = experiments.decided_total(fresh["tests"])
+        experiments.write_atomic(experiments.report_path(), json.dumps(fresh))
+        raise cli.StopRefused("fresh plan changed")
+
+    monkeypatch.setattr(cli, "execute_stop", refuse)
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    ui.text_input(key=f"who-{tid}").set_value("tester")
+    ui.checkbox(key=f"ok-{tid}").check().run(timeout=30)
+    ui.button(key=f"go-{tid}").click().run(timeout=30)
+    assert not ui.exception
+    assert any("fresh plan changed" in e.value for e in ui.error)
+    table = ui.dataframe[0].value.set_index("test")
+    if change == "health":
+        assert table.loc[MAIN, "verdict"] == "🧯 check data"
+        assert not any(b.key == f"go-{tid}" for b in ui.button)
+    else:
+        assert "3 plans" in table.loc[MAIN, "matured 60-day"]
+        assert not ui.checkbox(key=f"ok-{tid}").value
+        assert ui.button(key=f"go-{tid}").disabled
+    assert mocked["stopped"] == [] and not cli.audit_path().exists()
+
+
+def test_concurrent_report_writers_have_separate_temporary_files(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    target = tmp_path / "report.json"
+    barrier = threading.Barrier(2)
+    real_replace = experiments.os.replace
+    sources = []
+
+    def replace(src, dst):
+        sources.append(src)
+        barrier.wait(timeout=5)  # both writes finish before either writer replaces the target
+        real_replace(src, dst)
+
+    monkeypatch.setattr(experiments.os, "replace", replace)
+    with ThreadPoolExecutor(2) as pool:
+        writes = [pool.submit(experiments.write_atomic, target, json.dumps({"writer": name})) for name in ("A", "B")]
+        for write in writes:
+            write.result(timeout=10)
+    assert len(set(sources)) == 2
+    assert json.loads(target.read_text()) in [{"writer": "A"}, {"writer": "B"}]
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_failed_report_replace_preserves_report_and_cleans_temp(monkeypatch, tmp_path):
+    target = tmp_path / "report.json"
+    target.write_text('"previous"')
+
+    def fail(*args):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(experiments.os, "replace", fail)
+    with pytest.raises(OSError, match="replace failed"):
+        experiments.write_atomic(target, '"new"')
+    assert json.loads(target.read_text()) == "previous"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("horizon", [30, 60])
+def test_live_only_app_does_not_need_local_history_files(mocked, monkeypatch, horizon):
+    def missing(*args):
+        raise FileNotFoundError("users.csv.gz")
+
+    monkeypatch.setattr(experiments, "load", missing)
+    monkeypatch.setattr(experiments, "add_intent", lambda *args: pytest.fail("no history to train on"))
+    monkeypatch.setattr(experiments, "flow_live_metrics", lambda *args: {
+        "users": 12, "revenue": 24.0, "rev_per_user": 2.0, "trials": 0, "trials_finished": 0, "purchases": 2})
+    for test in mocked["tests"]:
+        test["goal"] = f"maximise {horizon}-day revenue"
+    r = experiments.build_report("other-app")
+    assert not r["has_history"] and r["data_end"] is None and r["intent"] is None
+    assert r["total_lost_per_month_usd"] == 0
+    tests = by_title(r)
+    assert tests[MAIN]["verdict"] == "unsupported"
+    assert all(a["users"] == 12 for a in tests[MAIN]["live_view"]["arms"].values())
+    draft = next(t for t in r["tests"] if t["state"] == "draft")
+    assert draft["verdict"] == "draft_plan" and draft["recommendation"].startswith("can't size")
+    assert experiments.report_path("other-app").exists()
+
+
+@pytest.mark.parametrize("state", ["live", "completed"])
+@pytest.mark.parametrize("case", ["constant", "zero_scale", "all_zero"])
+def test_inapplicable_sequential_model_requires_review(monkeypatch, state, case):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 10), ("b", 1)], [50, 50], state=state)
+    if case == "constant":
+        a, b = np.full(600, 10.0), np.zeros(600)
+    elif case == "zero_scale":
+        a, b = np.tile([0.9, 1.1], 300), np.tile([-1.1, -0.9], 300)
+    else:
+        a, b = np.zeros(600), np.zeros(600)
+    u.loc[u.flow == "a", "revenue"], u.loc[u.flow == "b", "revenue"] = a, b
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["health"]["healthy"]
+    assert res["sequential_p"] is None
+    assert all(c["sequential_p"] is None and not c["passed"] for c in res["comparisons"])
+    assert res["verdict"] == ("check_data" if state == "live" else "completed_check_failed")
+    reasons = " ".join(res["reasons"])
+    assert "not applicable" in reasons and "needs ≈" not in reasons
+    assert res["lost_per_month_usd"] == 0
+    json.dumps(res, allow_nan=False)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_winner_ranking_uses_revenue_before_rounding(monkeypatch, reverse):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 1), ("b", 1)], [50, 50])
+    u.loc[u.flow == "a", "revenue"] = np.tile([1.0039, 1.0041], 300)
+    u.loc[u.flow == "b", "revenue"] = np.tile([1.0009, 1.0011], 300)
+    t["price_usd"] = u.revenue
+    if reverse:
+        test["flows"].reverse()
+    res = experiments.judge(test, u, t, names)
+    assert res["winner"]["name"] == "A"
+    assert res["p_winner_better"] == 1 and res["verdict"] == "stop_and_roll_out"
+
+
+def test_lift_with_negative_baseline_uses_dollars_instead_of_percent(monkeypatch):
+    import numpy as np
+    from pa import notify
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 1), ("b", 1)], [50, 50])
+    u.loc[u.flow == "a", "revenue"] = np.tile([0.9, 1.1], 300)
+    u.loc[u.flow == "b", "revenue"] = np.tile([-0.11, -0.09], 300)
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["winner"]["name"] == "A" and res["lift_pct"] is None
+    assert notify.lift_text(res) == "vs $-0.10"
+
+
+def test_cli_read_timeout_is_bounded_and_releases_its_slot(monkeypatch):
+    import subprocess as sp
+    timeouts = []
+
+    def stall(cmd, **kwargs):
+        timeout = kwargs.get("timeout")
+        assert timeout is not None, "read call has no timeout"
+        timeouts.append(timeout)
+        raise sp.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(adapty_cli.subprocess, "run", stall)
+    with pytest.raises(adapty_cli.AdaptyError, match="read timed out"):
+        adapty_cli.run("ab-tests", "list")
+    assert timeouts == [adapty_cli.READ_TIMEOUT_SECONDS]  # a timeout is not retried
+    acquired = 0
+    try:
+        for _ in range(adapty_cli.MAX_CONCURRENT_CALLS):
+            assert adapty_cli._slots.acquire(blocking=False)
+            acquired += 1
+    finally:
+        for _ in range(acquired):
+            adapty_cli._slots.release()
+
+
+def test_dashboard_failed_refresh_keeps_saved_data_without_live_badge(mocked, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    r = experiments.build_report()
+    r["analyzed_at"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    experiments.write_atomic(experiments.report_path(), json.dumps(r))
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": r["app_id"], "title": "Lumen"}])
+
+    def fail(*args):
+        raise adapty_cli.AdaptyError("Adapty read timed out")
+
+    monkeypatch.setattr(experiments, "build_report", fail)
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    ui.button[0].click().run(timeout=30)
+    assert not ui.exception
+    assert any("read timed out" in w.value for w in ui.warning)
+    assert "Adapty API (live)" not in " ".join(c.value for c in ui.caption)
+    assert "saved report (offline)" in " ".join(c.value for c in ui.caption)
+    assert "Lifetime anchor" in ui.dataframe[0].value.set_index("test").loc[MAIN, "matured 60-day"]
+
+
+def _history_csvs(monkeypatch, users, transactions):
+    def read(path, **kwargs):
+        return (users if str(path).endswith("users.csv.gz") else transactions).copy()
+    monkeypatch.setattr(experiments.pd, "read_csv", read)
+
+
+def _exposure_history():
+    import pandas as pd
+    users = pd.DataFrame({"user_id": ["returning"],
+                          "install_at": pd.to_datetime(["2026-01-01"], utc=True),
+                          "exposed_at": ["2026-04-01T00:00:00Z"]})
+    tx = pd.DataFrame({"user_id": ["returning", "returning"],
+                       "purchased_at": pd.to_datetime(["2026-01-10", "2026-04-02"], utc=True),
+                       "refunded_at": pd.to_datetime([None, None], utc=True),
+                       "billing_issue_detected_at": pd.to_datetime([None, None], utc=True),
+                       "offer": ["paid", "paid"], "price_usd": [10.0, 100.0]})
+    return users, tx
+
+
+def test_returning_user_revenue_and_maturity_start_at_exposure(monkeypatch):
+    users, tx = _exposure_history()
+    _history_csvs(monkeypatch, users, tx)
+    u, t, _ = experiments.load()
+    assert u.revenue.iloc[0] == 100.0
+    assert not bool(u.matured.iloc[0])
+    assert t.day.tolist() == [-81.0, 1.0]
+    assert t.paid.tolist() == [False, True]
+
+
+def test_legacy_synthetic_history_keeps_its_install_clock(monkeypatch):
+    users, tx = _exposure_history()
+    _history_csvs(monkeypatch, users.drop(columns="exposed_at"), tx)
+    u, t, _ = experiments.load()
+    assert u.revenue.iloc[0] == 10.0 and bool(u.matured.iloc[0])
+    assert u.exposure_basis.iloc[0] == "install_at_proxy"
+
+
+def test_explicit_history_cutoff_excludes_future_purchases_and_refunds(monkeypatch):
+    import pandas as pd
+    users, tx = _exposure_history()
+    tx.loc[1, "refunded_at"] = pd.Timestamp("2026-04-10", tz="UTC")
+    future = tx.iloc[[1]].copy()
+    future["purchased_at"] = pd.Timestamp("2026-04-05", tz="UTC")
+    future["refunded_at"] = pd.NaT
+    future["price_usd"] = 200.0
+    _history_csvs(monkeypatch, users, pd.concat([tx, future], ignore_index=True))
+    u, t, end = experiments.load(observed_through="2026-04-02T23:59:59Z")
+    assert u.revenue.iloc[0] == 100.0 and not bool(u.matured.iloc[0])
+    assert end == pd.Timestamp("2026-04-02T23:59:59Z")
+    assert t.loc[t.price_usd.eq(100), "refunded_at"].isna().all()
+    assert not t.price_usd.eq(200).any()
+
+
+@pytest.mark.parametrize("exposed_at", [None, "invalid", "2025-12-31T00:00:00Z"])
+def test_explicit_exposure_never_falls_back_to_install_when_invalid(monkeypatch, exposed_at):
+    users, tx = _exposure_history()
+    users["exposed_at"] = exposed_at
+    _history_csvs(monkeypatch, users, tx)
+    with pytest.raises(ValueError, match="exposed_at"):
+        experiments.load()
+
+
+def _identified_history():
+    test, u, t, names = _synthetic([("a", 4), ("b", 10)], [50, 50])
+    u["exposed_at"] = u.install_at
+    u["exposure_basis"] = "exposed_at"
+    u["ab_test_id"] = test["ab_test_id"]
+    return test, u, t, names
+
+
+def test_history_matches_test_id_even_if_test_was_renamed(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["title"] = "Renamed experiment"
+    res = experiments.judge(test, u, t, names, owners={test["title"]: "another-id"})
+    assert res["verdict"] != "unsupported" and res["matured_users"] == 1200
+
+
+def test_same_title_does_not_borrow_another_test_id(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    u["ab_test_id"] = "different-id"
+    assert experiments.judge(test, u, t, names)["verdict"] == "unsupported"
+
+
+def test_explicit_exposures_before_test_start_are_not_current_evidence(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["started_at"] = "2026-11-06T00:00:00Z"
+    assert experiments.judge(test, u, t, names)["verdict"] == "unsupported"
+
+
+def test_exposure_history_requires_stable_test_ids(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    res = experiments.judge(test, u.drop(columns="ab_test_id"), t, names)
+    assert res["verdict"] == "unsupported" and "ab_test_id" in " ".join(res["reasons"])
+
+
+def test_exposure_window_does_not_change_with_refunds_after_the_horizon(monkeypatch):
+    import pandas as pd
+    users, tx = _exposure_history()
+    tx.loc[1, "refunded_at"] = pd.Timestamp("2026-06-10", tz="UTC")
+    _history_csvs(monkeypatch, users, tx)
+    u, t, _ = experiments.load(observed_through="2026-07-01T00:00:00Z")
+    assert bool(u.matured.iloc[0]) and u.revenue.iloc[0] == 100.0
+    assert t.loc[t.price_usd.eq(100), "refunded_at"].isna().all()
+
+
+def _hoeffding_p(a, b, **kwargs):
+    return experiments.bounded_revenue_check(a, b, **kwargs)["p"]
+
+
+def test_bounded_anytime_check_matches_a_known_result():
+    import numpy as np
+    a, b = np.full(100, 0.8), np.full(100, 0.2)
+    result = experiments.bounded_revenue_check(a, b, bounds=[0, 1])
+    assert result["p"] == pytest.approx(4.732290e-8, rel=1e-5)
+    assert result["ci95"][0] > 0 and result["ci95"][1] > 0.6
+
+
+def test_bounded_anytime_check_blocks_an_unseen_rare_payer():
+    import numpy as np
+    a, b = np.zeros(100), np.tile([0.99, 1.01], 50)
+    result = experiments.bounded_revenue_check(a, b, bounds=[0, 1000])
+    assert result["p"] == 1 and result["ci95"][0] < 0 < result["ci95"][1]
+
+
+@pytest.mark.parametrize("bounds", [None, [0, 0], [1, 0], [0, float("inf")], [0], "invalid"])
+def test_bounded_anytime_check_requires_fixed_valid_bounds(bounds):
+    import numpy as np
+    assert _hoeffding_p(np.ones(100), np.zeros(100), bounds=bounds) is None
+
+
+def test_bounded_anytime_check_refuses_values_outside_the_declared_range():
+    import numpy as np
+    assert _hoeffding_p(np.array([0, 1001]), np.array([0, 1]), bounds=[0, 1000]) is None
+    assert _hoeffding_p(np.array([float("nan")]), np.array([1]), bounds=[0, 1000]) is None
+
+
+def test_bounded_anytime_check_accounts_for_all_arm_pairs():
+    import numpy as np
+    a, b = np.full(100, 0.8), np.full(100, 0.2)
+    single = experiments.bounded_revenue_check(a, b, bounds=[0, 1])
+    three = experiments.bounded_revenue_check(a, b, bounds=[0, 1], pair_count=3)
+    assert three["p"] == pytest.approx(3 * single["p"])
+    assert three["ci95"][0] < single["ci95"][0]
+
+
+def test_bounded_anytime_check_allows_zero_variance_with_known_support():
+    import numpy as np
+    for check in (_hoeffding_p, experiments.always_valid_p):
+        assert check(np.ones(1000), np.zeros(1000), bounds=[0, 1]) < 0.05
+        assert check(np.zeros(1000), np.zeros(1000), bounds=[0, 1]) == 1
+        assert check(np.full(1000, 0.2), np.full(1000, -0.2), bounds=[-1, 1]) < 0.05
+
+
+def _zero_inflated(rng, n, payer_rate, price=40.0):
+    return price * (rng.random(n) < payer_rate)
+
+
+def test_betting_check_decides_a_realistic_gap_that_hoeffding_cannot():
+    """$8 vs $4 per user, 7,000 users per arm, $200 declared bound: variance-adaptive evidence decides."""
+    import numpy as np
+    rng = np.random.default_rng(20261108)
+    a, b = _zero_inflated(rng, 7000, 0.2), _zero_inflated(rng, 7000, 0.1)
+    hoeffding = experiments.bounded_revenue_check(a, b, bounds=[0, 200])
+    betting = experiments.betting_revenue_check(a, b, bounds=[0, 200])
+    assert hoeffding["p"] >= 0.05 and hoeffding["ci95"][0] < 0
+    assert betting["p"] < 0.05 and betting["ci95"][0] > 0
+    assert betting["ci95"][0] <= a.mean() - b.mean() <= betting["ci95"][1]
+    assert betting["ci95"][1] - betting["ci95"][0] < (hoeffding["ci95"][1] - hoeffding["ci95"][0]) / 3
+
+
+def test_betting_check_is_inconclusive_for_equal_arms():
+    import numpy as np
+    rng = np.random.default_rng(7)
+    a, b = _zero_inflated(rng, 5000, 0.1), _zero_inflated(rng, 5000, 0.1)
+    result = experiments.betting_revenue_check(a, b, bounds=[0, 200])
+    assert result["p"] >= 0.05 and result["ci95"][0] < 0 < result["ci95"][1]
+
+
+def test_betting_check_blocks_an_unseen_rare_payer():
+    import numpy as np
+    a, b = np.zeros(100), np.tile([0.99, 1.01], 50)
+    result = experiments.betting_revenue_check(a, b, bounds=[0, 1000])
+    assert result["p"] >= 0.05 and result["ci95"][0] < 0 < result["ci95"][1]
+
+
+@pytest.mark.parametrize("bounds", [None, [0, 0], [1, 0], [0, float("inf")], [0], "invalid"])
+def test_betting_check_requires_fixed_valid_bounds(bounds):
+    import numpy as np
+    result = experiments.betting_revenue_check(np.ones(100), np.zeros(100), bounds=bounds)
+    assert result["p"] is None and result["ci95"] is None and "revenue_bounds_usd" in result["reason"]
+
+
+def test_betting_check_refuses_values_outside_the_declared_range():
+    import numpy as np
+    assert experiments.betting_revenue_check(np.array([0, 1001]), np.array([0, 1]), bounds=[0, 1000])["p"] is None
+    assert experiments.betting_revenue_check(np.array([np.nan]), np.array([1]), bounds=[0, 1000])["p"] is None
+
+
+def test_betting_check_splits_error_across_every_arm():
+    import numpy as np
+    rng = np.random.default_rng(3)
+    a, b = _zero_inflated(rng, 3000, 0.2), _zero_inflated(rng, 3000, 0.1)
+    two = experiments.betting_revenue_check(a, b, bounds=[0, 200])
+    three = experiments.betting_revenue_check(a, b, bounds=[0, 200], arm_count=3)
+    assert three["p"] > two["p"]
+    assert three["ci95"][0] < two["ci95"][0] and three["ci95"][1] > two["ci95"][1]
+
+
+def test_betting_confidence_sequence_covers_every_prefix():
+    """One arm's sequence: the running interval at every look contains the true mean (seeded check)."""
+    import numpy as np
+    rng = np.random.default_rng(11)
+    misses = 0
+    for _ in range(200):
+        x = _zero_inflated(rng, 2000, 0.1) / 200  # true mean 0.02 on the [0, 1] scale
+        lo, hi = experiments.betting_cs_path(x, level=0.05)
+        assert lo.shape == hi.shape == (2000,)
+        misses += bool(((lo > 0.02) | (hi < 0.02)).any())
+    assert misses <= 10  # Ville: P(any miss) <= 5%; 10/200 leaves room for sampling noise
+
+
+def test_judge_uses_exposure_order_for_the_betting_sequence(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["revenue_bounds_usd"] = [0, 200]
+    rng = np.random.default_rng(5)
+    u.loc[u.flow.eq("a"), "revenue"] = _zero_inflated(rng, 600, 0.6)
+    u.loc[u.flow.eq("b"), "revenue"] = _zero_inflated(rng, 600, 0.2)
+    t["price_usd"] = u.revenue
+    shuffled = u.sample(frac=1, random_state=1).reset_index(drop=True)
+    res = experiments.judge(test, shuffled, t, names)
+    ordered = shuffled.sort_values(["exposed_at", "user_id"], kind="stable")
+    expected = experiments.betting_revenue_check(ordered.loc[ordered.flow.eq("a"), "revenue"].values,
+                                                 ordered.loc[ordered.flow.eq("b"), "revenue"].values,
+                                                 bounds=[0, 200], arm_count=2)
+    assert res["inference"]["method"] == "betting_cs" and res["inference"]["arm_count"] == 2
+    assert res["sequential_p"] == expected["p"] and res["anytime_ci95"] == expected["ci95"]
+
+
+def test_real_exposure_history_cannot_roll_out_without_declared_bounds(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "check_data" and res["sequential_p"] is None
+    assert "revenue_bounds_usd" in " ".join(res["reasons"])
+
+
+def test_full_judge_blocks_the_rare_payer_false_winner(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["revenue_bounds_usd"] = [0, 1000]
+    u.loc[u.flow.eq("a"), "revenue"] = 0.0
+    u.loc[u.flow.eq("b"), "revenue"] = np.tile([0.99, 1.01], 300)
+    t["price_usd"] = u.revenue
+    t["paid"] = u.revenue.gt(0)
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "keep_running" and res["sequential_p"] >= 0.05
+    assert res["lost_per_month_usd"] == 0 and res["anytime_ci95"][0] < 0 < res["anytime_ci95"][1]
+
+
+def test_real_exposure_history_can_decide_a_large_bounded_effect(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["revenue_bounds_usd"] = [0, 1]
+    u.loc[u.flow.eq("a"), "revenue"] = np.tile([0.79, 0.81], 300)
+    u.loc[u.flow.eq("b"), "revenue"] = np.tile([0.19, 0.21], 300)
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "stop_and_roll_out" and res["winner"]["name"] == "A"
+    assert res["sequential_p"] < 0.05 and res["anytime_ci95"][0] > 0
+    assert res["inference"]["method"] == "betting_cs" and res["inference"]["arm_count"] == 2
+
+
+def test_real_exposure_history_refuses_a_broken_bound(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["revenue_bounds_usd"] = [0, 1]  # exponential values exceed this declared support
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "check_data" and res["sequential_p"] is None
+    assert "outside" in " ".join(res["reasons"])
+
+
+def test_legacy_demo_is_explicitly_labeled_an_approximation(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 4), ("b", 10)], [50, 50])
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "stop_and_roll_out"
+    assert res["inference"]["method"] == "normal_approximation_demo"
+    assert res["anytime_ci95"] is None and "not validated" in " ".join(res["reasons"])
+
+
+def test_build_report_accepts_predeclared_per_test_bounds_and_cutoff(mocked, monkeypatch):
+    import numpy as np
+    import pandas as pd
+    test, u, t, names = _identified_history()
+    u.loc[u.flow.eq("a"), "revenue"] = np.tile([0.79, 0.81], 300)
+    u.loc[u.flow.eq("b"), "revenue"] = np.tile([0.19, 0.21], 300)
+    u["ai_edits_first_day"] = 0
+    u["intent"] = np.tile(["low", "mid", "high"], 400)
+    t["price_usd"] = u.revenue
+    mocked["tests"] = [test]
+    cutoff = "2026-12-01T00:00:00Z"
+    reads = []
+
+    def load(horizon=60, *, observed_through=None):
+        reads.append((horizon, observed_through))
+        return u.copy(), t.copy(), pd.Timestamp(cutoff)
+
+    monkeypatch.setattr(experiments, "load", load)
+    monkeypatch.setattr(experiments, "add_intent", lambda frame: frame)
+    monkeypatch.setattr(experiments, "flow_names", lambda: names)
+    r = experiments.build_report(revenue_bounds_usd={test["ab_test_id"]: [0, 1]}, observed_through=cutoff)
+    assert reads == [(60, cutoff)]
+    assert r["sources"]["history"] == "experiment exposure history"
+    judged = r["tests"][0]
+    assert judged["verdict"] == "stop_and_roll_out"
+    assert judged["inference"]["revenue_bounds_usd"] == [0.0, 1.0]
+    assert judged["loss_calculation"]["live_size_scale"] == 1.0
+    assert judged["loss_calculation"]["population_basis"] == "observed_exposures"
+    assert "revenue_bounds_usd" not in mocked["tests"][0]  # API metadata is not mutated
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": r["app_id"], "title": "Exposure test app"}])
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    assert not ui.exception
+    captions = " ".join(c.value for c in ui.caption)
+    assert "experiment exposure history" in captions and "anytime betting" in captions
+    assert "synthetic history" not in captions
+    audit = next(e for e in ui.expander if e.label == "How is the monthly loss calculated?")
+    assert "observed exposures" in " ".join(m.value for m in audit.markdown)
+    assert "95% anytime" in " ".join(m.value for m in ui.markdown)
+    fresh = experiments.build_report()  # the Change Guard rebuild must retain the approved metric protocol
+    assert fresh["tests"][0]["verdict"] == "stop_and_roll_out"
+    assert fresh["tests"][0]["inference"]["revenue_bounds_usd"] == [0.0, 1.0]
+    fresh["tests"][0]["horizon_days"] = 30
+    experiments.write_atomic(experiments.report_path(), json.dumps(fresh))
+    changed = experiments.build_report()
+    assert changed["tests"][0]["verdict"] == "check_data"  # a different horizon needs a new bounds declaration
+    experiments.write_atomic(experiments.report_path(), "[]")
+    rebuilt = experiments.build_report()
+    assert rebuilt["tests"][0]["verdict"] == "check_data"  # malformed cached protocols are ignored safely
+
+
+def test_real_history_preserves_sub_cent_revenue_in_the_estimate(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _identified_history()
+    test["revenue_bounds_usd"] = [0.8, 0.81]
+    u.loc[u.flow.eq("a"), "revenue"] = np.tile([0.8039, 0.8041], 300)
+    u.loc[u.flow.eq("b"), "revenue"] = np.tile([0.8009, 0.8011], 300)
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "stop_and_roll_out"
+    assert res["winner"]["rev_per_user"] == pytest.approx(0.804)
+    assert res["loser"]["rev_per_user"] == pytest.approx(0.801)
+    assert res["lost_per_month_usd"] == 0.92  # 1200 / 59 * 0.5 * 0.003 * 30
+
+
+def test_real_multi_arm_decision_corrects_for_every_arm(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 1), ("b", 1), ("c", 1)], [1, 1, 1])
+    u["exposed_at"], u["exposure_basis"], u["ab_test_id"] = u.install_at, "exposed_at", test["ab_test_id"]
+    test["revenue_bounds_usd"] = [0, 1]
+    for flow, mean in [("a", 0.9), ("b", 0.5), ("c", 0.1)]:
+        u.loc[u.flow.eq(flow), "revenue"] = mean + np.tile([-0.01, 0.01], 300)
+    t["price_usd"] = u.revenue
+    res = experiments.judge(test, u, t, names)
+    assert res["verdict"] == "stop_and_roll_out" and res["inference"]["arm_count"] == 3
+    ordered = u.sort_values(["exposed_at", "user_id"], kind="stable")
+    for comparison in res["comparisons"]:
+        other = comparison["other"]["name"].lower()
+        p = experiments.always_valid_p(ordered.loc[ordered.flow.eq("a"), "revenue"].values,
+                                       ordered.loc[ordered.flow.eq(other), "revenue"].values, bounds=[0, 1],
+                                       arm_count=3)
+        assert comparison["sequential_p"] == p
+
+
+@pytest.mark.parametrize("case, seed", [("uniform_AA", 801), ("zero_inflated_AA", 802),
+                                      ("rare_equal_means", 803), ("uneven_allocation_AA", 804),
+                                      ("three_arm_AA", 805), ("positive_effect", 806)])
+@pytest.mark.slow
+def test_bounded_policy_calibration(case, seed):
+    """Reproducible empirical checks of the decision rule (betting sequences at alpha/arms per arm).
+
+    Ville's inequality, not simulation, supplies the conditional guarantee; this guards the implementation.
+    """
+    from itertools import combinations
+    import numpy as np
+    from scipy import stats
+    rng = np.random.default_rng(seed)
+    repetitions, detected = 300, 0
+    looks = list(range(100, 1001, 100))
+    for _ in range(repetitions):
+        bounds = [0, 1]
+        if case == "rare_equal_means":
+            arms = [1000.0 * (rng.random(1000) < 0.001), 1.0 + rng.choice([-0.01, 0.01], 1000)]
+            bounds = [0, 1000]
+        elif case == "zero_inflated_AA":
+            arms = [50.0 * (rng.random(1000) < 0.1) for _ in range(2)]
+            bounds = [0, 50]
+        elif case == "uneven_allocation_AA":
+            arms = [rng.random(9000), rng.random(1000)]
+        elif case == "three_arm_AA":
+            arms = [rng.random(1000), rng.binomial(1, 0.5, 1000), np.full(1000, 0.5)]
+        elif case == "positive_effect":
+            arms = [rng.uniform(0.7, 0.9, 1000), rng.uniform(0.1, 0.3, 1000)]
+        else:
+            arms = [rng.random(1000), rng.random(1000)]
+        level = 0.05 / len(arms)
+        paths = [experiments.betting_cs_path((arm - bounds[0]) / (bounds[1] - bounds[0]), level=level)
+                 for arm in arms]
+        for n in looks:
+            idx = [n * 9 - 1 if case == "uneven_allocation_AA" and i == 0 else n - 1 for i in range(len(arms))]
+            if any(paths[a][0][idx[a]] > paths[b][1][idx[b]] or paths[b][0][idx[b]] > paths[a][1][idx[a]]
+                   for a, b in combinations(range(len(arms)), 2)):
+                detected += 1
+                break
+    interval = stats.binomtest(detected, repetitions).proportion_ci(0.95, method="wilson")
+    if case == "positive_effect":
+        assert interval.low > 0.8
+    else:
+        assert interval.high < 0.05
+    print("CALIBRATION " + json.dumps({"case": case, "seed": seed, "repetitions": repetitions, "looks": looks,
+                                      "method": "betting_cs", "detected": detected,
+                                      "rate": detected / repetitions, "ci95": [interval.low, interval.high]}))
+
+
+def test_betting_path_matches_the_two_arm_check():
+    """The calibration's path shortcut and the judge's check agree on the final look."""
+    import numpy as np
+    rng = np.random.default_rng(9)
+    a, b = _zero_inflated(rng, 3000, 0.2), _zero_inflated(rng, 3000, 0.1)
+    check = experiments.betting_revenue_check(a, b, bounds=[0, 200])
+    (la, ha), (lb, hb) = (experiments.betting_cs_path(x / 200, level=0.025) for x in (a, b))
+    assert check["ci95"] == pytest.approx([200 * (la[-1] - hb[-1]), 200 * (ha[-1] - lb[-1])])
+
+
+@pytest.mark.parametrize("timestamp", ["2026-04-01T02:00:00+02:00", "2026-04-01T00:00:00Z"])
+def test_exposure_clock_normalizes_timezones(monkeypatch, timestamp):
+    import pandas as pd
+    users, tx = _exposure_history()
+    users["exposed_at"] = timestamp
+    _history_csvs(monkeypatch, users, tx)
+    u, t, _ = experiments.load()
+    assert u.exposed_at.iloc[0] == pd.Timestamp("2026-04-01T00:00:00Z")
+    assert t.day.tolist() == [-81.0, 1.0] and u.revenue.iloc[0] == 100.0
+
+
+def test_exposure_horizon_includes_its_boundary_and_excludes_later_charges(monkeypatch):
+    import pandas as pd
+    users, tx = _exposure_history()
+    tx["purchased_at"] = pd.to_datetime(["2026-05-31T00:00:00Z", "2026-05-31T00:00:01Z"], utc=True)
+    tx["price_usd"] = [100.0, 200.0]
+    _history_csvs(monkeypatch, users, tx)
+    u, t, _ = experiments.load(observed_through="2026-06-01T00:00:00Z")
+    assert u.revenue.iloc[0] == 100.0 and bool(u.matured.iloc[0])
+    assert t.paid.tolist() == [True, False]
+
+
+def test_explicit_cutoff_retains_users_without_any_purchases(monkeypatch):
+    users, tx = _exposure_history()
+    _history_csvs(monkeypatch, users, tx.iloc[0:0])
+    u, t, _ = experiments.load(observed_through="2026-06-01T00:00:00Z")
+    assert len(u) == 1 and t.empty and u.revenue.iloc[0] == 0 and bool(u.matured.iloc[0])

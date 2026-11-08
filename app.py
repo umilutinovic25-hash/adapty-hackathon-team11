@@ -21,13 +21,13 @@ VERDICT = {
     "stop_and_roll_out": ("💰 Decided — stop and roll out the winner", "warning"),
     "split_by_segment": ("🔀 Winner differs by segment — split the audience", "warning"),
     "guardrail_failed": ("🚧 Winner on revenue, but a guardrail got worse — review before rollout", "warning"),
-    "check_data": ("🧯 Data health check failed — fix the split before trusting results", "warning"),
+    "check_data": ("🧯 Data or statistical checks need review — see the reasons before trusting results", "warning"),
     "keep_running": ("⏳ Not decided yet — keep running", "info"),
     "completed_confirmed": ("✅ Completed — full history confirms the result", "success"),
     "completed_inconclusive": ("⚠️ Completed — on full history the result is NOT significant", "warning"),
     "completed_disagrees": ("⚠️ Completed — history disagrees with the applied winner", "warning"),
     "completed_winner_unknown": ("⚠️ Completed — applied winner unknown; cannot confirm", "warning"),
-    "completed_check_failed": ("🧯 Completed — winner on revenue, but a health, guardrail or segment check failed",
+    "completed_check_failed": ("🧯 Completed — statistical, health, guardrail or segment checks need review",
                                "warning"),
     "draft_plan": ("📐 Draft — sample-size plan before you start", "info"),
     "unsupported": ("➖ Can't judge on history yet — showing what Adapty sees", "info"),
@@ -75,8 +75,10 @@ st.title("🧪 Experiment Autopilot for Adapty")
 st.caption("Adapty reads A/B tests from the day they start. We read them on matured revenue over the full history, "
            "and stop decided ones only after a human approves.")
 with st.expander("How we judge a test"):
-    st.markdown("- **Matured revenue:** 60-day net revenue per user (trials $0, refunds out), only users whose 60 days "
-                "have passed, over 4 months of history\n- **Health:** traffic split (SRM) and randomization balance\n"
+    st.markdown("- **Matured revenue:** net revenue since experiment exposure, over its revenue window "
+                "(synthetic demo: installation-time proxy)\n"
+                "- **Revenue evidence:** anytime betting confidence sequences with predeclared bounds; demo approximation labeled separately\n"
+                "- **Health:** traffic split (SRM) and randomization balance\n"
                 "- **Guardrails:** refund and billing-issue rate per charge\n- **Maturity:** how much revenue each arm "
                 "has collected by day 1/7/30\n- **Segments:** intent model, platform, channel (Bonferroni)\n"
                 "- **Change Guard:** plan, human approval, fresh re-check, audit log")
@@ -135,7 +137,7 @@ if not fresh_analysis and not recent:
 def provenance(target=st, *, history: bool = True, api: bool = True) -> None:
     sources = [api_source] if api else []
     if history and r.get("has_history", True):
-        sources.append("synthetic history")
+        sources.append(r.get("sources", {}).get("history") or "synthetic history")
     dates = f"Last analysis: {analysis_label}"
     if history:
         dates += f" · History through: {history_label}"
@@ -144,6 +146,10 @@ def provenance(target=st, *, history: bool = True, api: bool = True) -> None:
 
 if st.session_state.get("flash"):
     st.success(st.session_state.pop("flash"))
+if st.session_state.get("stop_error"):
+    st.error(st.session_state.pop("stop_error"))
+if approval_key := st.session_state.pop("approval_to_reset", None):
+    st.session_state[approval_key] = False
 if not r.get("has_history", True):
     st.info("No user→arm history for this app, so tests can't be judged on matured revenue yet. Below is what "
             "Adapty sees. In production the history comes from an Adapty S3/BigQuery export.")
@@ -156,7 +162,7 @@ share = (f" · ≈{r['total_lost_per_month_usd'] / r['mrr_usd']:.0%} of today's 
          if r.get("mrr_usd") else "")
 hero.markdown(f"<div style='font-size:15px;opacity:.75'>Lost per month on decided tests that still split traffic</div>"
               f"<div style='font-size:56px;font-weight:700;color:#F2A65A;line-height:1.1'>"
-              f"${r['total_lost_per_month_usd']:,.0f}</div>"
+              f"${r['total_lost_per_month_usd']:,.2f}</div>"
               f"<div style='font-size:15px;opacity:.75'>{len(decided)} of {len(live)} live tests decided{share}</div>",
               unsafe_allow_html=True)
 c2.metric("Early reads that are immature", sum(1 for t in live if (t.get("live_view") or {}).get("immature")),
@@ -172,20 +178,30 @@ with st.expander("How is the monthly loss calculated?"):
         if not calc:
             st.info(f"{t['title']}: re-run analysis to save the calculation inputs and interval.")
             continue
-        st.markdown(f"**{t['title']}** · Live-size scaling: "
-                    f"**{calc['live_population']:,} / {calc['offline_population']:,} = {calc['live_size_scale']:g}**. "
-                    f"{calc['offline_users_in_test']:,} offline users / {calc['history_span_days']} days "
-                    f"× {calc['live_size_scale']:g} = {calc['daily_users']:.6f} daily users.")
+        if calc.get("population_basis") == "observed_exposures":
+            st.markdown(f"**{t['title']}** · {calc['offline_users_in_test']:,} observed exposures / "
+                        f"{calc['history_span_days']} days = {calc['daily_users']:.6f} users entering daily. "
+                        "No synthetic population scaling.")
+        else:
+            st.markdown(f"**{t['title']}** · Live-size scaling: "
+                        f"**{calc['live_population']:,} / {calc['offline_population']:,} = {calc['live_size_scale']:g}**. "
+                        f"{calc['offline_users_in_test']:,} offline users / {calc['history_span_days']} days "
+                        f"× {calc['live_size_scale']:g} = {calc['daily_users']:.6f} daily users.")
         for arm in calc["arms"]:
+            gap = f"{arm['gap_per_user']:.6g}" if calc.get("population_basis") == "observed_exposures" else f"{arm['gap_per_user']:.2f}"
             st.markdown(f"{calc['daily_users']:.6f} daily users × {arm['losing_share']:.2%} losing arm share "
-                        f"({arm['name']}) × ${arm['gap_per_user']:.2f} revenue gap per user "
+                        f"({arm['name']}) × ${gap} revenue gap per user "
                         f"× {calc['month_days']} = **${arm['monthly_loss_usd']:,.2f}/month**.")
         ci = t.get("lost_per_month_ci95_usd")
         if ci:
-            st.markdown(f"95% bootstrap interval: **${ci[0]:,.2f}…${ci[1]:,.2f}/month**.")
+            method = {"anytime_betting": "anytime betting", "anytime_hoeffding": "anytime Hoeffding"}.get(
+                t.get("loss_interval_method"), "bootstrap")
+            st.markdown(f"95% {method} interval: **${ci[0]:,.2f}…${ci[1]:,.2f}/month**.")
     st.markdown(f"Total on decided live tests: **${r['total_lost_per_month_usd']:,.2f}/month**.")
-    st.caption("Intervals scale the existing two-arm revenue-gap bootstrap with traffic and allocation held fixed. "
-               "Traffic uncertainty is excluded; no aggregate interval is claimed for multi-arm tests.")
+    st.caption("Exposure-history estimates use raw revenue and anytime betting intervals. Synthetic/legacy demo "
+               "estimates use revenue/user rounded to cents and bootstrap intervals. Both hold traffic and allocation fixed; "
+               "traffic uncertainty is excluded, and "
+               "no aggregate interval is claimed for multi-arm tests.")
 names = r.get("segment_names", {})
 
 
@@ -213,7 +229,7 @@ st.dataframe(pd.DataFrame([{
     "test": t["title"],
     "verdict": ("📐 " + t["recommendation"].split(":")[0] if t["verdict"] == "draft_plan"
                 else SHORT.get(t["verdict"], t["verdict"])),
-    "$ / month": f"${t['lost_per_month_usd']:,.0f}" if t["state"] == "live" and t.get("lost_per_month_usd") else "",
+    "$ / month": f"${t['lost_per_month_usd']:,.2f}" if t["state"] == "live" and t.get("lost_per_month_usd") else "",
     f"matured {t['horizon_days']}-day": our_view(t),
     "Adapty right now": adapty_view(t),
 } for t in tests]), hide_index=True, use_container_width=True,
@@ -243,16 +259,30 @@ for t in tests:
             st.markdown(f"**What Adapty sees:** {adapty_view(t)}")
             continue
 
+        inference = t.get("inference", {})
+        if inference.get("method") == "normal_approximation_demo":
+            st.caption("Synthetic/legacy demo: normal approximation, not validated for real experiment decisions.")
+        elif inference.get("method") in ("betting_cs", "hoeffding_union"):
+            bounds = inference.get("revenue_bounds_usd")
+            detail = f" · predeclared revenue/user bounds ${bounds[0]:g}…${bounds[1]:g}" if bounds else " · bounds required"
+            if inference["method"] == "betting_cs":
+                st.caption(f"Revenue evidence: anytime betting confidence sequence · "
+                           f"{inference.get('arm_count', 2)} arm(s){detail}.")
+            else:
+                st.caption(f"Revenue evidence: anytime Hoeffding · {inference['pair_count']} arm pair(s){detail}.")
+        else:
+            st.caption("Legacy saved analysis: inference method not recorded; re-run analysis to review.")
+
         a, b, c = st.columns([2, 2, 3])
         a.metric(f"🏆 {t['winner']['name']}", f"${t['winner']['rev_per_user']:.2f} / user",
-                 f"{notify.lift_text(t)} vs other arm" if t["lift_pct"] is not None else "other arm earns $0")
+                 f"{notify.lift_text(t)} vs other arm" if t["lift_pct"] is not None else notify.lift_text(t))
         a.caption(f"payer rate {t['winner']['payer_rate']:.1%} · {t['winner']['users']:,} matured users")
         b.metric(t["loser"]["name"], f"${t['loser']['rev_per_user']:.2f} / user")
         b.caption(f"payer rate {t['loser']['payer_rate']:.1%} · {t['loser']['users']:,} matured users"
                   + "".join(f" · {o['name']} ${o['rev_per_user']:.2f}" for o in t.get("others", [])))
         c.markdown("**Why this verdict**\n" + "\n".join(f"- {x}" for x in t["reasons"]))
         if t["state"] == "live":
-            c.markdown(f"- Cost of keeping it running: **${t['lost_per_month_usd']:,.0f}/month**")
+            c.markdown(f"- Cost of keeping it running: **${t['lost_per_month_usd']:,.2f}/month**")
             ci = t.get("lost_per_month_ci95_usd")
             if ci:
                 c.markdown(f"- 95% interval for monthly loss: **${ci[0]:,.2f}…${ci[1]:,.2f}**")
@@ -263,8 +293,12 @@ for t in tests:
         provenance(right, api=False)
         left.info(f"**Adapty right now** (since {lv['since']}, users in this test only)\n\n{adapty_view(t)}"
                   if lv else "**Adapty right now**\n\nno live data for this test yet")
-        right.success(f"**Matured {t['horizon_days']}-day revenue, full history**\n\n{our_view(t)} · "
-                      f"95% CI ${t['diff_ci95'][0]:.2f}…${t['diff_ci95'][1]:.2f} per user")
+        show_history = right.success if t["verdict"] in ("stop_and_roll_out", "completed_confirmed") else right.info
+        interval = t.get("anytime_ci95")
+        ci_text = (f"95% anytime interval ${interval[0]:.4g}…${interval[1]:.4g}" if interval is not None else
+                   f"95% bootstrap CI ${t['diff_ci95'][0]:.2f}…${t['diff_ci95'][1]:.2f}")
+        show_history(f"**Matured {t['horizon_days']}-day revenue, full history**\n\n{our_view(t)} · "
+                     f"{ci_text} per user")
         if t["maturity"]["early_bias"]:
             live_note = (f" Right now in Adapty, {lv['trials_finished']} of {lv['trials']} trials in this test have "
                          f"finished." if lv and lv.get("trials") else "")
@@ -312,8 +346,8 @@ for t in tests:
                 f"**{t['winner']['name']}** only.\n"
                 f"- **Who is affected:** the {t['losing_share']:.0%} who now get "
                 f"*{', '.join(a['name'] for a in t['arms'][1:])}* "
-                f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} new users/day).\n"
-                f"- **Expected effect:** +${t['lost_per_month_usd']:,.0f}/month in {t['horizon_days']}-day revenue.\n"
+                f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} users entering the test/day).\n"
+                f"- **Expected effect:** +${t['lost_per_month_usd']:,.2f}/month in {t['horizon_days']}-day revenue.\n"
                 f"- **Can't be undone:** a stopped test can't restart; to test again, create a copy.")
             with st.expander("Show the Adapty CLI command"):
                 st.code(" ".join(adapty_cli.stop_command(t["ab_test_id"], t["winner"]["content_id"], app_id=APP_ID)),
@@ -328,13 +362,14 @@ for t in tests:
                     st.session_state.log.append(entry)
                     st.session_state.flash = f"Stopped “{t['title']}” in Adapty — {t['winner']['name']} rolled out."
                 except StopRefused as err:
-                    st.error(f"Not stopped: {err}. Review the updated card and approve again.")
+                    st.session_state.stop_error = f"Not stopped: {err}. Review the updated card and approve again."
+                    st.session_state.approval_to_reset = f"ok-{t['ab_test_id']}"
                 except RuntimeError as err:
-                    st.error(f"Not stopped: {err}")
+                    st.session_state.stop_error = f"Not stopped: {err}"
+                    st.session_state.approval_to_reset = f"ok-{t['ab_test_id']}"
                 finally:  # the fresh re-check (and a stop) rewrote the saved report: show it either way
                     load_report.clear()
-                if st.session_state.get("flash"):
-                    st.rerun()
+                st.rerun()
 
 if r.get("intent"):
     st.divider()
@@ -350,7 +385,8 @@ if r.get("intent"):
                         "AI edits on day 1", "payers", "AI edits on day 1", "users who pay (%)", ",.1f"),
                     use_container_width=True)
     st.caption("The intent model checks whether a winner is the same for low-, mid- and high-intent users. "
-               "Here it is, so one winner for everyone is the right call.")
+               "The per-test verdicts show whether revenue and safety checks support a rollout; "
+               "small or unclear segments remain uncertain.")
 
 st.divider()
 p1, p2 = st.columns(2)

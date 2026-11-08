@@ -34,6 +34,7 @@ def _message(raw: str) -> str:
 
 MAX_CONCURRENT_CALLS = 2  # be nice to Adapty's API: it throttles bursts of parallel requests
 MAX_RETRIES = 4
+READ_TIMEOUT_SECONDS = 30
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT_CALLS)
 
 
@@ -45,12 +46,14 @@ def _throttle_wait(message: str) -> float | None:
     return float(m.group(1)) + 0.25 if m else 1.0
 
 
-def _call(cmd: list[str]) -> subprocess.CompletedProcess:
-    """One CLI call: at most MAX_CONCURRENT_CALLS at a time, retried when Adapty asks us to slow down."""
+def _call(cmd: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess:
+    """One CLI call: capped concurrency, optional read timeout, and retries when Adapty asks us to slow down."""
     for attempt in range(MAX_RETRIES + 1):
         try:
             with _slots:
-                out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        except subprocess.TimeoutExpired as err:
+            raise AdaptyError(f"Adapty read timed out after {timeout} seconds") from err
         except FileNotFoundError as err:  # CLI not installed or not on PATH
             raise AdaptyError("the Adapty CLI is not available (npm i -g adapty)") from err
         wait = _throttle_wait((out.stderr or out.stdout or "")) if out.returncode != 0 else None
@@ -61,7 +64,7 @@ def _call(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 def _exec(args: list[str]) -> dict:
-    out = _call(["adapty", *args, "--json"])
+    out = _call(["adapty", *args, "--json"], timeout=READ_TIMEOUT_SECONDS)
     if out.returncode != 0:
         raise AdaptyError(_message((out.stderr or out.stdout).strip()))
     try:

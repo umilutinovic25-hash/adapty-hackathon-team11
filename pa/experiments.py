@@ -5,7 +5,7 @@ a test on recent traffic, often before trial revenue has had time to arrive. The
 every user saw over 4 months, so we can judge tests on matured revenue.
 
 Checks borrowed from experimentation platforms (GrowthBook / Statsig / Eppo):
-  - SRM (traffic split) and randomization balance (pre-exposure intent score per arm)
+  - SRM (traffic split) and intent-score balance (causal interpretation requires pre-exposure features)
   - guardrail metrics (refund rate, billing-issue rate)
   - metric maturity (how much of 60-day revenue each arm has collected by day 1 / 7 / 30)
   - segment consistency with a Bonferroni correction
@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -66,18 +67,43 @@ def placement_codes() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------- data
-def load(horizon: int = HORIZON_DAYS) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+def load(horizon: int = HORIZON_DAYS, *, observed_through: str | pd.Timestamp | None = None
+         ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+    """Revenue since exposure, with an explicit observation cutoff when available.
+
+    Old synthetic CSVs have no exposure timestamp; retain their install-time proxy and label it as such.
+    An explicitly supplied exposure must be valid: missing values never silently become installation dates.
+    """
     u = pd.read_csv(f"{DATA_DIR}/users.csv.gz", parse_dates=["install_at"])
     t = pd.read_csv(f"{DATA_DIR}/transactions.csv.gz",
                     parse_dates=["purchased_at", "refunded_at", "billing_issue_detected_at"])
-    end = t.purchased_at.max()
-    t = t.merge(u[["user_id", "install_at"]], on="user_id")
-    t["day"] = (t.purchased_at - t.install_at).dt.total_seconds() / 86400
-    t["paid"] = t.offer.ne("free_trial") & (t.day <= horizon)
+    explicit = "exposed_at" in u
+    u["install_at"] = pd.to_datetime(u.install_at, utc=True)
+    u["exposed_at"] = pd.to_datetime(u.exposed_at if explicit else u.install_at,
+                                     utc=True, errors="coerce", format="mixed")
+    if u.exposed_at.isna().any() or (u.exposed_at < u.install_at).any():
+        raise ValueError("exposed_at must be valid, non-missing and no earlier than install_at")
+    u["exposure_basis"] = "exposed_at" if explicit else "install_at_proxy"
+    for col in ("purchased_at", "refunded_at", "billing_issue_detected_at"):
+        t[col] = pd.to_datetime(t[col], utc=True)
+    end = pd.to_datetime(observed_through, utc=True) if observed_through is not None else t.purchased_at.max()
+    if pd.isna(end):
+        raise ValueError("observed_through is required when history has no transactions")
+    if explicit or observed_through is not None:
+        t = t[t.purchased_at <= end].copy()
+        for col in ("refunded_at", "billing_issue_detected_at"):
+            t.loc[t[col] > end, col] = pd.NaT
+    t = t.merge(u[["user_id", "install_at", "exposed_at"]], on="user_id", validate="many_to_one")
+    if explicit:  # each mature user's metric is fixed at their horizon; later events cannot rewrite past looks
+        cutoff = t.exposed_at + pd.Timedelta(days=horizon)
+        for col in ("refunded_at", "billing_issue_detected_at"):
+            t.loc[t[col] > cutoff, col] = pd.NaT
+    t["day"] = (t.purchased_at - t.exposed_at).dt.total_seconds() / 86400
+    t["paid"] = t.offer.ne("free_trial") & t.day.between(0, horizon)
     net = t[t.paid & t.refunded_at.isna()]
     u["revenue"] = u.user_id.map(net.groupby("user_id").price_usd.sum()).fillna(0.0)
     u["payer"] = (u.revenue > 0).astype(int)
-    u["matured"] = u.install_at <= end - pd.Timedelta(days=horizon)
+    u["matured"] = u.exposed_at <= end - pd.Timedelta(days=horizon)
     return u, t, end
 
 
@@ -121,19 +147,205 @@ def boot(a: np.ndarray, b: np.ndarray, n: int = 3000, alpha: float = 0.05,
 
 
 
-def always_valid_p(a: np.ndarray, b: np.ndarray, mde: float = MDE) -> float:
-    """Always-valid p-value for mean(a) != mean(b) (mixture SPRT, Johari et al. 2017, normal approximation).
-    The dashboard and the daily cron re-check the same test again and again; a fixed-horizon test peeked at every day
-    declares false winners far more often than 5%. This p-value stays valid however often it is looked at.
-    Mixture width tau = the smallest lift worth detecting (MDE x baseline revenue per user)."""
+def _demo_normal_p(a: np.ndarray, b: np.ndarray, mde: float = MDE) -> float | None:
+    """Legacy normal-mixture approximation for the synthetic demo, without a distribution-free validity claim.
+
+    Retained to preserve the documented demo verdicts. Actual exposure data uses bounded_revenue_check instead.
+    """
     a, b = np.asarray(a, float), np.asarray(b, float)
     v = a.var(ddof=1) / a.size + b.var(ddof=1) / b.size
-    tau2 = (mde * np.concatenate([a, b]).mean()) ** 2
-    if v <= 0 or tau2 <= 0:
-        return 1.0
+    baseline = float(np.concatenate([a, b]).mean())
+    tau2 = (mde * baseline) ** 2
+    if not np.isfinite(v) or not np.isfinite(tau2) or v <= 0 or baseline <= 0 or tau2 <= 0:
+        return None
     d = a.mean() - b.mean()
     log_lr = 0.5 * np.log(v / (v + tau2)) + tau2 * d * d / (2 * v * (v + tau2))
     return float(min(1.0, np.exp(-log_lr)))
+
+
+def _bounded_arms(a, b, bounds) -> tuple:
+    """Validate two user-level revenue vectors against fixed, predeclared bounds.
+
+    Returns (a, b, lower, upper, None) or (None, None, None, None, unavailable-result).
+    """
+    unavailable = {"p": None, "ci95": None, "bounds_usd": None}
+    if isinstance(bounds, (str, bytes)):
+        return None, None, None, None, {**unavailable, "reason": "declare numeric revenue_bounds_usd [lower, upper] "
+                                                                  "before collecting data"}
+    try:
+        lower, upper = map(float, bounds)
+        a, b = np.asarray(a, float), np.asarray(b, float)
+    except (TypeError, ValueError):
+        return None, None, None, None, {**unavailable, "reason": "declare fixed revenue_bounds_usd [lower, upper] "
+                                                                  "before collecting data"}
+    width = upper - lower
+    if not np.isfinite([lower, upper, width]).all() or width <= 0:
+        return None, None, None, None, {**unavailable, "reason": "revenue_bounds_usd must be finite and lower < upper"}
+    unavailable["bounds_usd"] = [lower, upper]
+    if a.ndim != 1 or b.ndim != 1 or min(a.size, b.size) == 0:
+        return None, None, None, None, {**unavailable, "reason": "each arm needs a non-empty vector of independent users"}
+    if not all(np.isfinite(x).all() and (x >= lower).all() and (x <= upper).all() for x in (a, b)):
+        return None, None, None, None, {**unavailable, "reason": "revenue is non-finite or outside the predeclared "
+                                                                  "bounds; review the metric"}
+    return a, b, lower, upper, None
+
+
+def bounded_revenue_check(a: np.ndarray, b: np.ndarray, *, bounds=None, pair_count: int = 1,
+                          alpha: float = 0.05) -> dict:
+    """Time-uniform Hoeffding test for independent users with fixed, predeclared horizon-revenue bounds.
+
+    Reference method: valid but very wide, because it ignores the observed variance. Decisions use
+    betting_revenue_check. For fixed n,m: P(|gap| >= d) <= 2 exp(-2 d^2 / (R^2(1/n+1/m))). Spending weight
+    1/[n(n+1)m(m+1)] sums to one over all sample-size pairs. A union bound therefore covers arbitrary
+    repeated looks; pair_count additionally covers all possible arm pairs before a winner is selected.
+    Bounds must be known before observation, never fitted to the sample maximum. No observations are clipped.
+    Source for the fixed-sample inequality: https://doi.org/10.1080/01621459.1963.10500830
+    """
+    a, b, lower, upper, unavailable = _bounded_arms(a, b, bounds)
+    if unavailable:
+        return unavailable
+    width = upper - lower
+    if not isinstance(pair_count, (int, np.integer)) or pair_count < 1 or not 0 < alpha < 1:
+        return {"p": None, "ci95": None, "bounds_usd": [lower, upper], "reason": "invalid pair count or significance level"}
+    n, m = a.size, b.size
+    gap = float(a.mean() - b.mean())
+    log_budget = float(np.log(2.0 * pair_count) + np.log(n) + np.log(n + 1) + np.log(m) + np.log(m + 1))
+    variance_scale = 1 / n + 1 / m
+    log_p = log_budget - 2 * (gap / width) ** 2 / variance_scale
+    p = float(np.exp(max(log_p, np.log(np.finfo(float).tiny)))) if log_p < 0 else 1.0
+    radius = width * float(np.sqrt(variance_scale / 2 * (log_budget - np.log(alpha))))
+    return {"p": p, "ci95": [max(-width, gap - radius), min(width, gap + radius)],
+            "bounds_usd": [lower, upper], "reason": None}
+
+
+# ------------------------------------------------- betting confidence sequences
+# Waudby-Smith & Ramdas (2024), "Estimating means of bounded random variables by betting", JRSS-B,
+# https://doi.org/10.1093/jrsssb/qkad009 — hedged capital process with predictable plug-in (PrPl-EB) bets.
+BETTING_GRID = 1001          # candidate means on the [0, 1] scale; intervals are widened by one grid step per side
+BETTING_TRUNCATION = 0.5     # c in the paper: bets never exceed c/m or c/(1-m), so capital stays positive
+_BETTING_CHUNK_CELLS = 2_000_000
+
+
+def _betting_bets(x: np.ndarray, tuning_level: float) -> np.ndarray:
+    """Predictable bet sizes: bet t uses only observations 1..t-1."""
+    t = np.arange(1, x.size + 1, dtype=float)
+    mu_hat = (0.5 + np.cumsum(x)) / (t + 1)
+    sigma2 = (0.25 + np.cumsum((x - mu_hat) ** 2)) / (t + 1)
+    sigma2_prev = np.concatenate([[0.25], sigma2[:-1]])
+    return np.sqrt(2 * np.log(2 / tuning_level) / (sigma2_prev * t * np.log1p(t)))
+
+
+def _betting_log_capital(x: np.ndarray, bets: np.ndarray, m: np.ndarray, cumulative: bool) -> np.ndarray:
+    """log max(K+/2, K-/2) for candidate means m: every prefix (cumulative) or only the last one."""
+    with np.errstate(divide="ignore"):
+        up = np.minimum(bets[:, None], BETTING_TRUNCATION / m[None, :])
+        down = np.minimum(bets[:, None], BETTING_TRUNCATION / (1 - m[None, :]))
+    diff = x[:, None] - m[None, :]
+    plus, minus = np.log1p(up * diff), np.log1p(-down * diff)
+    if cumulative:
+        plus, minus = np.cumsum(plus, axis=0), np.cumsum(minus, axis=0)
+    else:
+        plus, minus = plus.sum(axis=0), minus.sum(axis=0)
+    return np.log(0.5) + np.maximum(plus, minus)
+
+
+def _grid_chunks(n: int):
+    grid = np.linspace(0.0, 1.0, BETTING_GRID)
+    step = max(1, _BETTING_CHUNK_CELLS // max(n, 1))
+    for start in range(0, grid.size, step):
+        yield start, grid[start:start + step]
+
+
+def _final_log_capital(x: np.ndarray, tuning_level: float) -> np.ndarray:
+    bets = _betting_bets(x, tuning_level)
+    return np.concatenate([_betting_log_capital(x, bets, m, cumulative=False) for _, m in _grid_chunks(x.size)])
+
+
+def _hull(log_capital: np.ndarray, threshold: float) -> tuple[float, float]:
+    """Conservative interval around {m : log capital < threshold}.
+
+    Capital is quasiconvex in m (K+ falls and K- rises as m grows), so the continuous confidence set is an interval
+    and lies within one grid step of the accepted grid points, or of the grid minimum when no grid point is accepted.
+    """
+    accepted = np.flatnonzero(log_capital < threshold)
+    first, last = (accepted[0], accepted[-1]) if accepted.size else (int(np.argmin(log_capital)),) * 2
+    top = BETTING_GRID - 1
+    return max(first - 1, 0) / top, min(last + 1, top) / top
+
+
+def betting_cs_path(x: np.ndarray, *, level: float = 0.05, tuning_level: float | None = None
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """Running confidence sequence for the mean of [0, 1] observations in arrival order.
+
+    P(some prefix interval misses the mean) <= level, by Ville's inequality, for independent observations with a
+    common mean. Returns lower and upper bounds for every prefix length.
+    """
+    x = np.asarray(x, float)
+    tuning_level = level if tuning_level is None else tuning_level
+    bets, threshold, n = _betting_bets(x, tuning_level), np.log(1 / level), x.size
+    first = np.full(n, BETTING_GRID)
+    last = np.full(n, -1)
+    best_value, best_index = np.full(n, np.inf), np.zeros(n, dtype=int)
+    for start, m in _grid_chunks(n):
+        w = _betting_log_capital(x, bets, m, cumulative=True)
+        ok = w < threshold
+        has = ok.any(axis=1)
+        first = np.where(has, np.minimum(first, start + ok.argmax(axis=1)), first)
+        last = np.where(has, np.maximum(last, start + m.size - 1 - ok[:, ::-1].argmax(axis=1)), last)
+        local = w.argmin(axis=1)
+        value = w[np.arange(n), local]
+        better = value < best_value
+        best_value, best_index = np.where(better, value, best_value), np.where(better, start + local, best_index)
+    empty = last < 0
+    first, last = np.where(empty, best_index, first), np.where(empty, best_index, last)
+    top = BETTING_GRID - 1
+    return np.maximum(first - 1, 0) / top, np.minimum(last + 1, top) / top
+
+
+def betting_revenue_check(a: np.ndarray, b: np.ndarray, *, bounds=None, arm_count: int = 2,
+                          alpha: float = 0.05) -> dict:
+    """Anytime-valid comparison of two arms from per-arm betting confidence sequences.
+
+    Each of the experiment's arm_count arms gets a confidence sequence at level alpha/arm_count, so every pairwise
+    difference, every look and the data-driven choice of winner are covered at once (union bound over arms).
+    Arrays must be in exposure order: each look must see a prefix of the same arrival sequence. Unlike Hoeffding,
+    the bets adapt to the observed variance, so zero-inflated revenue with a wide declared bound stays decidable.
+    p is arm_count times the smallest per-arm level at which the two intervals separate; bets are tuned at a fixed
+    level, so the intervals are nested in the level and p < alpha exactly when ci95 excludes zero.
+    """
+    a, b, lower, upper, unavailable = _bounded_arms(a, b, bounds)
+    if unavailable:
+        return unavailable
+    width = upper - lower
+    if not isinstance(arm_count, (int, np.integer)) or arm_count < 2 or not 0 < alpha < 1:
+        return {"p": None, "ci95": None, "bounds_usd": [lower, upper], "reason": "invalid arm count or significance level"}
+    tuning = alpha / arm_count
+    wa, wb = (_final_log_capital((x - lower) / width, tuning) for x in (a, b))
+
+    def separated(threshold: float) -> bool:
+        (la, ha), (lb, hb) = _hull(wa, threshold), _hull(wb, threshold)
+        return la > hb or lb > ha
+
+    ci_threshold = float(np.log(arm_count / alpha))
+    (la, ha), (lb, hb) = _hull(wa, ci_threshold), _hull(wb, ci_threshold)
+    ci = [width * (la - hb), width * (ha - lb)]
+    if not separated(0.0):
+        p = 1.0
+    else:
+        low, high = (ci_threshold, 745.0) if separated(ci_threshold) else (0.0, ci_threshold)
+        if separated(high):
+            low = high
+        else:
+            for _ in range(60):
+                mid = (low + high) / 2
+                low, high = (mid, high) if separated(mid) else (low, mid)
+        p = float(min(1.0, arm_count * np.exp(-low)))
+    return {"p": p, "ci95": ci, "bounds_usd": [lower, upper], "reason": None}
+
+
+def always_valid_p(a: np.ndarray, b: np.ndarray, *, bounds=None, arm_count: int = 2) -> float | None:
+    """Anytime-valid p-value used for decisions; None when the required support assumptions cannot be checked."""
+    return betting_revenue_check(a, b, bounds=bounds, arm_count=arm_count)["p"]
 
 
 def sample_size_per_arm(values: np.ndarray, mde: float = MDE, alpha: float = 0.05, power: float = 0.8) -> int:
@@ -303,31 +515,45 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                                        "matured revenue yet (an Adapty S3/BigQuery export would add it)")
     if len(arms) < 2:
         return unsupported(base, test, "fewer than two arms")
-    owner = (owners or {}).get(test["title"], test["ab_test_id"])
-    if owner != test["ab_test_id"]:
-        return unsupported(base, test, f"a copy of an earlier test with the same title (id {owner}): the offline "
-                                       "history belongs to that test, and this copy has no matured users of its own")
-    e_all = u[u.ab_test == test["title"]]
+    explicit_exposure = "exposed_at" in u and not (
+        "exposure_basis" in u and u.exposure_basis.eq("install_at_proxy").all())
+    if "ab_test_id" in u:
+        e_all = u[u.ab_test_id.eq(test["ab_test_id"])]
+    elif explicit_exposure:
+        return unsupported(base, test, "exposure history requires stable ab_test_id values, not a title match")
+    else:
+        owner = (owners or {}).get(test["title"], test["ab_test_id"])
+        if owner != test["ab_test_id"]:
+            return unsupported(base, test, f"a copy of an earlier test with the same title (id {owner}): the offline "
+                                           "history belongs to that test, and this copy has no matured users of its own")
+        e_all = u[u.ab_test == test["title"]]
+    if explicit_exposure and test.get("started_at"):
+        start = pd.to_datetime(test["started_at"], utc=True)
+        e_all = e_all[pd.to_datetime(e_all.exposed_at, utc=True) >= start]
     if e_all.empty:
         return unsupported(base, test, "no user→arm history for this test (the offline dataset covers the seeded "
                                        "Lumen app; in production this comes from an Adapty S3/BigQuery export)")
     horizon = base["horizon_days"]
 
     e = e_all[e_all.matured]
+    if explicit_exposure:  # the betting sequence needs one arrival order; every look then sees a prefix of it
+        e = e.sort_values(["exposed_at", "user_id"], kind="stable")
     stats_by_arm = []
     for a in arms:
         s = e[e.flow == code.get(a["name"])]
-        stats_by_arm.append({**a, "users": int(len(s)), "rev_per_user": round(float(s.revenue.mean()), 2),
+        rpu = float(s.revenue.mean())
+        stats_by_arm.append({**a, "users": int(len(s)), "rev_per_user": rpu if explicit_exposure else round(rpu, 2),
                              "payer_rate": round(float(s.payer.mean()), 4), "_ids": s.user_id})
     if min(a["users"] for a in stats_by_arm) < 100:
         return unsupported(base, test, "fewer than 100 matured users in an arm: too early to judge")
     # Keep the runner-up in the compact view, but verify every losing arm independently.
-    ranked = sorted(stats_by_arm, key=lambda a: -a["rev_per_user"])
+    # Rank on raw means, even when two arms display the same RPU rounded to cents.
+    ranked = sorted(stats_by_arm, key=lambda a: -float(e[e.user_id.isin(a["_ids"])].revenue.mean()))
     win, lose, others = ranked[0], ranked[1], ranked[2:]
     w_rev, l_rev = e[e.user_id.isin(win["_ids"])].revenue.values, e[e.user_id.isin(lose["_ids"])].revenue.values
     gap = win["rev_per_user"] - lose["rev_per_user"]
 
-    # health: SRM + randomization balance on the pre-exposure intent score (GrowthBook threshold p < 0.001)
+    # health: intent balance is a randomization diagnostic only if its features predate exposure
     # SRM uses the weights as configured now (Adapty keeps no weight history); an arm at weight 0 is switched off,
     # so it has no expected share and is left out instead of making the expectation 0
     w = np.array([a["weight"] for a in ranked], dtype=float)
@@ -337,11 +563,20 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
              if on.sum() >= 2 else 1.0)
     bal_p = float(stats.f_oneway(*[e[e.user_id.isin(a["_ids"])].intent_score for a in ranked]).pvalue)
 
+    pair_count = len(arms) * (len(arms) - 1) // 2
+    inference_method = "betting_cs" if explicit_exposure else "normal_approximation_demo"
     comparisons = []
     for other in ranked[1:]:
         other_rev = e[e.user_id.isin(other["_ids"])].revenue.values
         clo, chi, cp = boot(w_rev, other_rev)
-        cseq = always_valid_p(w_rev, other_rev)
+        if explicit_exposure:
+            sequential = betting_revenue_check(w_rev, other_rev, bounds=test.get("revenue_bounds_usd"),
+                                                arm_count=len(ranked))
+        else:
+            approx = _demo_normal_p(w_rev, other_rev)
+            sequential = {"p": min(1.0, approx * pair_count) if approx is not None else None,
+                          "ci95": None, "reason": None, "bounds_usd": None}
+        cseq = sequential["p"]
         if other is lose:
             lo, hi, p, seq_p = clo, chi, cp, cseq
         # guardrails: the winner must not raise refunds or billing issues
@@ -368,10 +603,14 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
         flipped = [s for s in segs if s["ci"][1] < 0]
         unclear = [s for s in segs if s["ci"][0] <= 0 <= s["ci"][1]]
 
-        significant = clo > 0 and cp > 0.99 and cseq < 0.05
+        significant = clo > 0 and cp > 0.99 and cseq is not None and cseq < 0.05
         comparisons.append({"other": {k: v for k, v in other.items() if k != "_ids"},
                             "diff_ci95": [round(clo, 2), round(chi, 2)],
-                            "p_winner_better": round(cp, 4), "sequential_p": float(f"{cseq:.3g}"),
+                            "p_winner_better": round(cp, 4),
+                            "sequential_p": (cseq if explicit_exposure else float(f"{cseq:.3g}"))
+                            if cseq is not None else None,
+                            "anytime_ci95": sequential["ci95"], "sequential_reason": sequential["reason"],
+                            "revenue_bounds_usd": sequential["bounds_usd"],
                             "significant": significant,
                             "guardrails": {"winner": gw, "other": gl, "refund_p": round(refund_p, 4),
                                            "billing_p": round(billing_p, 4), "failed": [n for n, _ in guard_fail]},
@@ -396,16 +635,20 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                       f"whatever the final winner.")
 
     # Money counts only arms the winner verifiably beats, each followed for the horizon.
-    days = (e_all.install_at.max() - e_all.install_at.min()).days or 1
-    daily_users = len(e_all) / days * (LIVE_USERS / OFFLINE_USERS)
+    clock = e_all.exposed_at if "exposed_at" in e_all else e_all.install_at
+    days = (clock.max() - clock.min()).days or 1
+    size_scale = 1.0 if explicit_exposure else LIVE_USERS / OFFLINE_USERS
+    daily_users = len(e_all) / days * size_scale
     total_w = float(w.sum())
     lost_month = daily_users * 30 * sum(a["weight"] / total_w * (win["rev_per_user"] - a["rev_per_user"])
                                         for c in comparisons if c["passed"] for a in [c["other"]])
     losing_share = sum(a["weight"] for a in ranked[1:]) / total_w
     loss_calculation = {
         "offline_users_in_test": int(len(e_all)), "history_span_days": int(days),
-        "live_population": LIVE_USERS, "offline_population": OFFLINE_USERS,
-        "live_size_scale": LIVE_USERS / OFFLINE_USERS, "daily_users": daily_users, "month_days": 30,
+        "live_population": None if explicit_exposure else LIVE_USERS,
+        "offline_population": None if explicit_exposure else OFFLINE_USERS,
+        "population_basis": "observed_exposures" if explicit_exposure else "synthetic_scaled",
+        "live_size_scale": size_scale, "daily_users": daily_users, "month_days": 30,
         "arms": [{"name": c["other"]["name"], "losing_share": c["other"]["weight"] / total_w,
                   "gap_per_user": win["rev_per_user"] - c["other"]["rev_per_user"],
                   "monthly_loss_usd": round(daily_users * c["other"]["weight"] / total_w
@@ -417,18 +660,21 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     loss_ci = None
     if len(comparisons) == 1 and first["passed"]:
         factor = daily_users * lose["weight"] / total_w * 30
-        loss_ci = [round(factor * lo, 2), round(factor * hi, 2)]
+        interval = first["anytime_ci95"] if explicit_exposure else [lo, hi]
+        loss_ci = [round(factor * interval[0], 2), round(factor * interval[1], 2)]
 
     decided = all(c["significant"] for c in comparisons)
+    sequential_unavailable = any(c["sequential_p"] is None for c in comparisons)
     healthy = srm_p > 0.01 and bal_p > 0.001
     n_needed = sample_size_per_arm(np.concatenate([w_rev, l_rev]))
     applied_winner = test.get("winner_flow_id")
     if test["state"] == "completed":  # same checks as a live rollout: health, guardrails, segments
-        verdict = ("completed_inconclusive" if not decided else
+        verdict = ("completed_check_failed" if sequential_unavailable else
+                   "completed_inconclusive" if not decided else
                    "completed_check_failed" if not healthy or guard_fail or flipped else
                    "completed_winner_unknown" if not applied_winner else
                    "completed_disagrees" if applied_winner != win["content_id"] else "completed_confirmed")
-    elif not healthy:
+    elif not healthy or sequential_unavailable:
         verdict = "check_data"
     elif decided and guard_fail:
         verdict = "guardrail_failed"
@@ -439,8 +685,11 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     else:
         verdict = "keep_running"
 
+    seq_label = f"{seq_p:.2g}" if seq_p is not None else "not applicable"
+    seq_name = "anytime betting p" if explicit_exposure else "demo normal-approximation p"
     reasons = [f"{win['name']} earns ${win['rev_per_user']:.2f} vs ${lose['rev_per_user']:.2f} per user in "
-               f"{horizon}-day revenue (95% CI of the gap ${lo:.2f}…${hi:.2f}, P(better) {p:.1%}, always-valid p={seq_p:.2g})",
+               f"{horizon}-day revenue (95% bootstrap CI of the gap ${lo:.2f}…${hi:.2f}, "
+               f"P(better) {p:.1%}, {seq_name}={seq_label})",
                f"traffic split {'OK' if srm_p > 0.01 else 'BROKEN'} (SRM p={srm_p:.2f}), groups "
                f"{'balanced' if bal_p > 0.001 else 'UNBALANCED'} on intent (p={bal_p:.2f})",
                "guardrails OK (refunds, billing issues)" if not guard_fail else
@@ -448,29 +697,48 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
                f"segments (Bonferroni-corrected): winner clearly ahead in {len(segs) - len(flipped) - len(unclear)} "
                f"of {len(segs)}, unclear in {len(unclear)}, reversed in {len(flipped)}"]
     for c in comparisons[1:]:
+        seq_label = f"{c['sequential_p']:.2g}" if c["sequential_p"] is not None else "not applicable"
         reasons.append(f"vs {c['other']['name']}: 95% CI ${c['diff_ci95'][0]:.2f}…${c['diff_ci95'][1]:.2f}, "
-                       f"P(better) {c['p_winner_better']:.1%}, always-valid p={c['sequential_p']:.2g}; "
+                       f"P(better) {c['p_winner_better']:.1%}, {seq_name}={seq_label}; "
                        + ("all checks passed" if c["passed"] else "not verified: rollout blocked"))
+    if sequential_unavailable:
+        if explicit_exposure:
+            notes = sorted({c["sequential_reason"] for c in comparisons if c["sequential_reason"]})
+            reasons.append("sequential revenue check is not applicable: " + "; ".join(notes))
+        else:
+            reasons.append("sequential revenue check is not applicable with zero variance or a non-positive revenue "
+                           "scale; review the statistical model before rollout, rather than just collecting more users")
+    if not explicit_exposure:
+        reasons.append("synthetic/legacy demo uses installation as an exposure proxy and a normal approximation; "
+                       "not validated for real experiment decisions")
     if verdict == "completed_winner_unknown":
         reasons.append("applied winner is unknown: history cannot confirm what Adapty rolled out")
     elif verdict == "completed_disagrees":
         reasons.append(f"history disagrees with the applied winner {applied_winner}: history favours {win['name']}")
     if verdict == "keep_running":
-        reasons.append(f"needs ≈{n_needed:,} matured users per arm to detect a {MDE:.0%} lift")
+        reasons.append("bounded anytime evidence remains inconclusive; the normal-approximation sample-size "
+                       "estimate is not a decision deadline" if explicit_exposure else
+                       f"needs ≈{n_needed:,} matured users per arm to detect a {MDE:.0%} lift")
 
     for a in ranked:
         a.pop("_ids")
     return {**base, "matured_users": int(len(e)), "comparisons": comparisons, "applied_winner_id": applied_winner,
             "arms": ranked, "winner": win, "loser": lose, "others": others,
             "losing_share": round(losing_share, 4),
-            "lift_pct": round(100 * gap / lose["rev_per_user"], 1) if lose["rev_per_user"] else None,
-            "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4), "sequential_p": float(f"{seq_p:.3g}"),
+            "lift_pct": round(100 * gap / lose["rev_per_user"], 1) if lose["rev_per_user"] > 0 else None,
+            "diff_ci95": [round(lo, 2), round(hi, 2)], "p_winner_better": round(p, 4),
+            "sequential_p": (seq_p if explicit_exposure else float(f"{seq_p:.3g}"))
+            if seq_p is not None else None,
+            "anytime_ci95": first["anytime_ci95"],
+            "inference": {"method": inference_method, "pair_count": pair_count, "arm_count": len(ranked),
+                          "revenue_bounds_usd": first["revenue_bounds_usd"]},
             "health": {"srm_pvalue": round(srm_p, 4), "balance_pvalue": round(bal_p, 4), "healthy": healthy},
             "guardrails": first["guardrails"],
             "maturity": {"winner": mw, "other": ml, "early_bias": early_bias},
             "live_view": live_view(test, arms),
             "daily_users_in_test": round(daily_users, 1), "lost_per_month_usd": round(lost_month, 2),
             "loss_calculation": loss_calculation, "lost_per_month_ci95_usd": loss_ci,
+            "loss_interval_method": "anytime_betting" if explicit_exposure else "bootstrap",
             "segments": segs, "segments_flipped": len(flipped), "segments_unclear": len(unclear),
             "sample_size_per_arm": n_needed, "verdict": verdict, "reasons": reasons}
 
@@ -480,8 +748,10 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
     # users who reached THIS placement (a flow can be shown at several placements)
     pl = u[u.placement == base["placement_code"]] if base.get("placement_code") else u.iloc[0:0]
     hist = pl[pl.matured]
-    days = (pl.install_at.max() - pl.install_at.min()).days or 1 if not pl.empty else 1
-    daily = len(pl) / days * (LIVE_USERS / OFFLINE_USERS) if not pl.empty else 0
+    clock = pl.exposed_at if "exposed_at" in pl else pl.install_at if not pl.empty else None
+    days = (clock.max() - clock.min()).days or 1 if not pl.empty else 1
+    size_scale = 1.0 if "exposure_basis" in pl and pl.exposure_basis.eq("exposed_at").all() else LIVE_USERS / OFFLINE_USERS
+    daily = len(pl) / days * size_scale if not pl.empty else 0
     n = sample_size_per_arm(hist.revenue.values) if len(hist) > 30 else None
     weights = [a["weight"] for a in arms]
     min_share = min(weights) / sum(weights) if weights and min(weights) > 0 else 0
@@ -506,9 +776,14 @@ def plan_draft(base: dict, arms: list[dict], u: pd.DataFrame, code: dict) -> dic
 
 # ---------------------------------------------------------------- report
 def write_atomic(path: Path, text: str) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def report_path(app_id: str | None = None) -> Path:
@@ -517,21 +792,29 @@ def report_path(app_id: str | None = None) -> Path:
     return out_dir() / ("report.json" if app_id == adapty_cli.DEFAULT_APP_ID else f"report-{app_id}.json")
 
 
-def build_report(app_id: str | None = None) -> dict:
+def build_report(app_id: str | None = None, *, revenue_bounds_usd: dict | None = None,
+                 observed_through: str | pd.Timestamp | None = None) -> dict:
+    """Analyze the configured history. Bounds are a predeclared protocol keyed by test ID, not estimated from data."""
     app_id = app_id or adapty_cli.DEFAULT_APP_ID
     with adapty_cli.use_app(app_id):
         has_history = app_id in history_apps()  # the offline user→arm history belongs to the seeded app(s)
         datasets: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
-        base_u, base_t, end = load(HORIZON_DAYS)
         if has_history:
+            base_u, base_t, end = (load(HORIZON_DAYS, observed_through=observed_through)
+                                   if observed_through is not None else load(HORIZON_DAYS))
             base_u = add_intent(base_u)
-        else:  # no history for this app: skip the model, keep the columns judges expect
-            base_u = base_u.iloc[0:0].assign(intent_score=pd.Series(dtype=float), intent=pd.Series(dtype=str))
+        else:  # live-only apps must also work when the offline CSVs are not installed
+            base_u = pd.DataFrame(columns=["user_id", "ab_test", "placement", "install_at", "intent"]).assign(
+                matured=pd.Series(dtype=bool), revenue=pd.Series(dtype=float),
+                ai_edits_first_day=pd.Series(dtype=float), intent_score=pd.Series(dtype=float))
+            base_t, end = pd.DataFrame(), None
         datasets[HORIZON_DAYS] = (base_u, base_t)
 
         def data_for(h: int):
+            if not has_history:
+                return datasets[HORIZON_DAYS]
             if h not in datasets:  # another horizon: recompute revenue, keep the same intent scores
-                u_h, t_h, _ = load(h)
+                u_h, t_h, _ = load(h, observed_through=observed_through) if observed_through is not None else load(h)
                 u_h = u_h.merge(base_u[["user_id", "intent_score", "intent"]], on="user_id")
                 datasets[h] = (u_h, t_h)
             return datasets[h]
@@ -540,18 +823,41 @@ def build_report(app_id: str | None = None) -> dict:
         all_tests = adapty_cli.list_tests()
         owners = history_owners(all_tests)
         tests = [x for x in all_tests if x["state"] in ("live", "completed", "draft")]
+        bounds_by_test = dict(revenue_bounds_usd or {})
+        if revenue_bounds_usd is None:
+            try:
+                previous = json.loads(report_path(app_id).read_text())
+            except (OSError, ValueError):
+                previous = {}
+            if isinstance(previous, dict) and previous.get("app_id") == app_id and previous.get("schema") == REPORT_SCHEMA:
+                fresh_horizons = {x["ab_test_id"]: horizon_of(x) for x in tests}
+                for old in previous.get("tests", []):
+                    if not isinstance(old, dict):
+                        continue
+                    if old.get("ab_test_id") not in fresh_horizons:
+                        continue
+                    inf = old.get("inference", {})
+                    if isinstance(inf, dict) and inf.get("method") in ("betting_cs", "hoeffding_union") and old.get(
+                            "horizon_days") == fresh_horizons.get(old.get("ab_test_id")):
+                        bounds_by_test[old["ab_test_id"]] = inf.get("revenue_bounds_usd")
         for tst in tests:  # build the per-horizon datasets up front, before running judges in threads
             data_for(horizon_of(tst))
         from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
         with ThreadPoolExecutor(max_workers=4) as pool:  # judges wait on Adapty CLI calls (live view)
             results = list(pool.map(adapty_cli.in_current_app(
-                lambda x: judge(x, *data_for(horizon_of(x)), names, placements, owners)), tests))
+                lambda x: judge({**x, "revenue_bounds_usd": bounds_by_test.get(
+                    x["ab_test_id"], x.get("revenue_bounds_usd"))},
+                    *data_for(horizon_of(x)), names, placements, owners)), tests))
         judged = [res for res in results if res is not None]
         m = base_u[base_u.matured]
         bins = pd.cut(m.ai_edits_first_day, [-1, 0, 2, 5, 1000], labels=["0", "1–2", "3–5", "6+"])
         report = {
-            "schema": REPORT_SCHEMA, "app_id": app_id, "has_history": has_history, "data_end": str(end),
-            "sources": {"adapty": "Adapty API (live)", "history": "synthetic history" if has_history else None},
+            "schema": REPORT_SCHEMA, "app_id": app_id, "has_history": has_history,
+            "data_end": str(end) if end is not None else None,
+            "sources": {"adapty": "Adapty API (live)", "history":
+                        ("experiment exposure history" if "exposure_basis" in base_u
+                         and base_u.exposure_basis.eq("exposed_at").all() else "synthetic history")
+                        if has_history else None},
             "horizon_days": HORIZON_DAYS,
             "segment_names": {s["id"]: s["title"] for s in adapty_cli.run("segments", "list")["data"]},
             "tests": judged,

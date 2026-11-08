@@ -32,7 +32,7 @@ def report(fresh: bool, app_id: str | None = None) -> dict:
 
 def brief(r: dict) -> str:
     lines = [f"# Adapty A/B tests — matured revenue, full history (app {r['app_id']})",
-             f"Revenue lost per month on decided live tests: **${r['total_lost_per_month_usd']:,.0f}**", ""]
+             f"Revenue lost per month on decided live tests: **${r['total_lost_per_month_usd']:,.2f}**", ""]
     if not r.get("has_history", True):
         lines += ["_No user→arm history for this app: tests are listed with what Adapty sees._", ""]
     for t in r["tests"]:
@@ -45,7 +45,7 @@ def brief(r: dict) -> str:
             arms = ", ".join(f"{k} {v.get('users', '?')} users ${v.get('revenue', 0):,.0f}" for k, v in lv["arms"].items())
             lines.append(f"- Adapty since {lv['since']}: {arms}; trials finished {lv['trials_finished']}/{lv['trials']}")
         if t["state"] == "live" and "lost_per_month_usd" in t:
-            lines.append(f"- Cost of keeping it running: ${t['lost_per_month_usd']:,.0f}/month")
+            lines.append(f"- Cost of keeping it running: ${t['lost_per_month_usd']:,.2f}/month")
         lines.append("")
     return "\n".join(lines)
 
@@ -75,7 +75,7 @@ def make_plan(r: dict, test_id: str) -> dict:
     return {"app_id": r["app_id"], "test": t["title"], "placement": t["placement"], "audience": audience,
             "winner": t["winner"]["name"], "winner_id": t["winner"]["content_id"],
             "affected": f"{t['losing_share']:.0%} now on {losers} "
-                        f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} new users/day)",
+                        f"(≈{t['daily_users_in_test'] * t['losing_share']:.0f} users entering the test/day)",
             "expected_effect_usd_per_month": t["lost_per_month_usd"], "reversible": False, "command": command}
 
 
@@ -133,7 +133,7 @@ def main() -> None:
         print("| app | tests | live | decided | $/month | history |\n|---|---|---|---|---|---|")
         for row in rows:
             print(f"| {row['app']} | {row['tests']} | {row['live']} | {row['decided_live']} | "
-                  f"${row['lost_per_month_usd']:,.0f} | {'yes' if row['has_history'] else 'live only'} |")
+                  f"${row['lost_per_month_usd']:,.2f} | {'yes' if row['has_history'] else 'live only'} |")
     elif a.cmd == "notify":  # meant for a daily cron: always judge on fresh Adapty data
         r = report(fresh=True, app_id=a.app)
         title = next((x["title"] for x in adapty_cli.list_apps() if x["id"] == r["app_id"]), r["app_id"])

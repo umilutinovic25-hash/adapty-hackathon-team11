@@ -34,7 +34,8 @@ losing arms. It is an estimate, not booked revenue or MRR. Today's $6,351 MRR is
 comparison uses different revenue windows and does not mean a 28% MRR increase.
 
 **Can I audit the headline?** Open the expander under the hero number. Daily traffic is scaled by
-**5,000 / 50,000 = 0.1**, with unrounded inputs retained in the report:
+**5,000 / 50,000 = 0.1**, with unrounded traffic inputs retained in the report. The point estimate uses each
+arm's revenue/user rounded to cents; winner ranking and bootstrap intervals use raw revenue:
 
 - Onboarding: 27,569 offline users / 120 days × 0.1 = 22.974166… daily users;
   × 50% losing share × $4.05 revenue gap × 30 = **$1,395.68/month**.
@@ -47,6 +48,10 @@ comparison uses different revenue windows and does not mean a 28% MRR increase.
 
 **Why trust the stats?** 60-day net revenue (trials $0, refunds removed), only users whose 60 days have passed,
 bootstrap CI, SRM and balance checks, guardrails per charge with a user-level bootstrap, Bonferroni on segments.
+The synthetic demo keeps a labeled normal approximation; it is not statistical certification. Actual exposure
+history uses per-arm betting confidence sequences (anytime-valid, variance-adaptive) with predeclared total
+user-revenue bounds, splitting the error across all arms.
+Missing or broken bounds block rollout. Its validity still depends on independent users and correct fixed-horizon data.
 
 **What if the data changes between plan and click?** Stop re-judges on fresh Adapty data and refuses if the verdict or
 the winner changed. Every stop is written to an audit log with app, test, winner and approver.
@@ -67,7 +72,7 @@ the CLI and dashboard. [Exact commands and paths](README.md#seed-a-rehearsal-app
 is needed; the matured analysis uses the synthetic history. Keep the main Lumen tests live for the demo.
 
 **What did you build during the hackathon?** All of it: analysis, dashboard, agent CLI, Claude Code skill, Slack
-digest, **67 tests**. Pre-existing: open-source libraries only. AI tools: Claude Code, disclosed in the README.
+digest, **124 tests**. Pre-existing: open-source libraries only. AI tools: Claude Code and Codex, disclosed in the README.
 
 **What's next?** S3/BigQuery history, a daily Slack digest with an approve link, and a home inside Adapty next to
 Autopilot.

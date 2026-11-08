@@ -17,7 +17,7 @@ DASHBOARD_URL = os.getenv("AUTOPILOT_DASHBOARD_URL", "http://localhost:8501")
 
 
 def lift_text(t: dict) -> str:
-    """'+12.5%', or 'vs $0.00' when the other arm earned nothing (a relative lift is undefined there)."""
+    """'+12.5%', or the dollar baseline when the other arm has zero or negative revenue."""
     if t.get("lift_pct") is None:
         return f"vs ${t['loser']['rev_per_user']:.2f}"
     return f"{t['lift_pct']:+}%"
@@ -31,7 +31,7 @@ def digest(report: dict, app_title: str | None = None) -> dict:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "No live test is decided yet. ✅"}})
     else:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
-                       f"*{len(decided)} live test(s) are decided*, costing *${report['total_lost_per_month_usd']:,.0f}"
+                       f"*{len(decided)} live test(s) are decided*, costing *${report['total_lost_per_month_usd']:,.2f}"
                        f"/month* on losing arms."}})
         for t in decided:
             lv = t.get("live_view") or {}
@@ -45,11 +45,11 @@ def digest(report: dict, app_title: str | None = None) -> dict:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
                            f"*{t['title']}* · {t['placement']}\n🏆 {t['winner']['name']} "
                            f"{lift_text(t)} {t['horizon_days']}-day revenue/user "
-                           f"(P {t['p_winner_better']:.0%}) · ${t['lost_per_month_usd']:,.0f}/month{warn}"}})
+                           f"(P {t['p_winner_better']:.0%}) · ${t['lost_per_month_usd']:,.2f}/month{warn}"}})
         blocks.append({"type": "actions", "elements": [{"type": "button", "style": "primary",
                        "text": {"type": "plain_text", "text": "Review & approve"},
                        "url": f"{DASHBOARD_URL}?app={report['app_id']}"}]})
-    text = f"{len(decided)} decided Adapty test(s), ${report['total_lost_per_month_usd']:,.0f}/month at stake"
+    text = f"{len(decided)} decided Adapty test(s), ${report['total_lost_per_month_usd']:,.2f}/month at stake"
     return {"text": text, "blocks": blocks}
 
 

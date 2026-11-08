@@ -21,3 +21,5 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: seeded statistical calibration (~90 s); run with -m slow"]
