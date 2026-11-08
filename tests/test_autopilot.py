@@ -661,3 +661,45 @@ def test_dashboard_live_badge_requires_a_fresh_analysis(mocked, monkeypatch):
     assert not ui.exception
     assert "Adapty API (live)" in " ".join(c.value for c in ui.caption)
     assert not any("saved report (offline)" in w.value for w in ui.warning)
+
+
+def test_monthly_loss_calculation_reconciles_demo_headline(mocked):
+    r = experiments.build_report()
+    tests = by_title(r)
+    assert r["total_lost_per_month_usd"] == 1749.31
+    for title, expected in [(ONB, 1395.68), (MAIN, 353.63)]:
+        t = tests[title]
+        calc = t["loss_calculation"]
+        assert calc["live_population"] == 5000 and calc["offline_population"] == 50000
+        assert calc["live_size_scale"] == 0.1
+        assert calc["daily_users"] == calc["offline_users_in_test"] / calc["history_span_days"] * 0.1
+        assert round(sum(calc["daily_users"] * arm["losing_share"] * arm["gap_per_user"] * 30
+                         for arm in calc["arms"]), 2) == t["lost_per_month_usd"] == expected
+        assert t["lost_per_month_ci95_usd"][0] < expected < t["lost_per_month_ci95_usd"][1]
+
+
+def test_monthly_loss_interval_scales_the_existing_bootstrap_gap(monkeypatch):
+    monkeypatch.setattr(adapty_cli, "run", fake_run)
+    test, u, t, names = _synthetic([("a", 4), ("b", 10)], [1, 1])
+    res = experiments.judge(test, u, t, names)
+    lo, hi, _ = experiments.boot(u[u.flow == "b"].revenue.values, u[u.flow == "a"].revenue.values)
+    factor = len(u) / 59 * 0.1 * 0.5 * 30
+    assert res["lost_per_month_ci95_usd"] == [round(factor * lo, 2), round(factor * hi, 2)]
+    # The interval is per two-arm comparison; no sum of CIs is claimed for a multi-arm test.
+    test3, u3, t3, names3 = _synthetic([("a", 4), ("b", 10), ("c", 5)], [1, 1, 1])
+    assert experiments.judge(test3, u3, t3, names3)["lost_per_month_ci95_usd"] is None
+
+
+def test_dashboard_exposes_the_headline_calculation(mocked, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    experiments.build_report()
+    monkeypatch.setattr(adapty_cli, "list_apps", lambda: [{"id": adapty_cli.DEFAULT_APP_ID, "title": "Lumen"}])
+    st.cache_data.clear()
+    ui = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run(timeout=30)
+    assert not ui.exception
+    audit = next(e for e in ui.expander if e.label == "How is the monthly loss calculated?")
+    text = " ".join(m.value for m in audit.markdown)
+    assert "5,000 / 50,000 = 0.1" in text
+    assert "daily users" in text and "losing arm share" in text and "revenue gap" in text
+    assert all(value in text for value in ["$1,395.68", "$353.63", "$1,749.31", "95%", "new cohorts"])

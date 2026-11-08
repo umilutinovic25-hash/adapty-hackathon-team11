@@ -49,7 +49,7 @@ def flow_names() -> dict[str, str]:
     return {**FALLBACK_FLOW_NAMES, **found}  # a flow the regex misses still maps
 
 
-REPORT_SCHEMA = 7  # bump when the report's keys change; readers rebuild older reports
+REPORT_SCHEMA = 8  # bump when the report's keys change; readers rebuild older reports
 def history_apps() -> set[str]:
     """Apps seeded from the offline dataset: the default app always, plus OFFLINE_APP_IDS (comma-separated),
     e.g. a rehearsal copy. Read at call time so a changed environment takes effect."""
@@ -402,6 +402,22 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
     lost_month = daily_users * 30 * sum(a["weight"] / total_w * (win["rev_per_user"] - a["rev_per_user"])
                                         for c in comparisons if c["passed"] for a in [c["other"]])
     losing_share = sum(a["weight"] for a in ranked[1:]) / total_w
+    loss_calculation = {
+        "offline_users_in_test": int(len(e_all)), "history_span_days": int(days),
+        "live_population": LIVE_USERS, "offline_population": OFFLINE_USERS,
+        "live_size_scale": LIVE_USERS / OFFLINE_USERS, "daily_users": daily_users, "month_days": 30,
+        "arms": [{"name": c["other"]["name"], "losing_share": c["other"]["weight"] / total_w,
+                  "gap_per_user": win["rev_per_user"] - c["other"]["rev_per_user"],
+                  "monthly_loss_usd": round(daily_users * c["other"]["weight"] / total_w
+                                            * (win["rev_per_user"] - c["other"]["rev_per_user"]) * 30, 2)}
+                 for c in comparisons if c["passed"]],
+    }
+    # Scale the existing gap bootstrap, holding traffic and configured allocation fixed.
+    # Unverified arms contribute no claimed loss; multi-arm intervals need a joint bootstrap.
+    loss_ci = None
+    if len(comparisons) == 1 and first["passed"]:
+        factor = daily_users * lose["weight"] / total_w * 30
+        loss_ci = [round(factor * lo, 2), round(factor * hi, 2)]
 
     decided = all(c["significant"] for c in comparisons)
     healthy = srm_p > 0.01 and bal_p > 0.001
@@ -454,6 +470,7 @@ def judge(test: dict, u: pd.DataFrame, t: pd.DataFrame, names: dict, placements:
             "maturity": {"winner": mw, "other": ml, "early_bias": early_bias},
             "live_view": live_view(test, arms),
             "daily_users_in_test": round(daily_users, 1), "lost_per_month_usd": round(lost_month, 2),
+            "loss_calculation": loss_calculation, "lost_per_month_ci95_usd": loss_ci,
             "segments": segs, "segments_flipped": len(flipped), "segments_unclear": len(unclear),
             "sample_size_per_arm": n_needed, "verdict": verdict, "reasons": reasons}
 

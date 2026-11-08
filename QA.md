@@ -29,8 +29,21 @@ safely, on matured revenue with health checks.
 so the verdict is "roll out to everyone". (2) The agent interface: a Claude Code skill reads the account, explains the
 numbers, and stops a test only after an explicit yes. That human-in-the-loop design is the point.
 
-**Is $1,749 real money?** It is one month of new installs on the losing arms, each followed for 60 days, scaled to
-Lumen's live size (5k of the 50k offline users). It is an estimate of revenue left on the table, not booked revenue.
+**Is $1,749 real money?** It is expected 60-day net revenue from new cohorts enrolled over 30 days on verified
+losing arms. It is an estimate, not booked revenue or MRR. Today's $6,351 MRR is only a size reference: the ≈28%
+comparison uses different revenue windows and does not mean a 28% MRR increase.
+
+**Can I audit the headline?** Open the expander under the hero number. Daily traffic is scaled by
+**5,000 / 50,000 = 0.1**, with unrounded inputs retained in the report:
+
+- Onboarding: 27,569 offline users / 120 days × 0.1 = 22.974166… daily users;
+  × 50% losing share × $4.05 revenue gap × 30 = **$1,395.68/month**.
+- Main: 4,185 / 120 × 0.1 = 3.4875 daily users;
+  × 50% × $6.76 × 30 = **$353.63/month**.
+- Total: **$1,749.31/month**. The existing gap bootstrap gives two-arm 95% monthly intervals of
+  **$1,211.86…$1,581.51** and **$250.84…$462.25**, respectively. They hold traffic and allocation fixed;
+  they exclude traffic uncertainty. No aggregate multi-arm interval is claimed, and unverified arms contribute
+  no claimed loss.
 
 **Why trust the stats?** 60-day net revenue (trials $0, refunds removed), only users whose 60 days have passed,
 bootstrap CI, SRM and balance checks, guardrails per charge with a user-level bootstrap, Bonferroni on segments.

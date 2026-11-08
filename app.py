@@ -155,6 +155,29 @@ c2.metric("Early reads that are immature", sum(1 for t in live if (t.get("live_v
           help="Live tests where most trials in Adapty haven't finished yet")
 c3.metric("Completed but not significant", sum(1 for t in tests if t["verdict"] == "completed_inconclusive"))
 provenance()
+with st.expander("How is the monthly loss calculated?"):
+    provenance()
+    st.markdown("Expected revenue of **new cohorts** enrolled over 30 days, each followed for the test's revenue "
+                "horizon. Today's MRR is a size reference; this estimate is not MRR.")
+    for t in decided:
+        calc = t.get("loss_calculation")
+        if not calc:
+            st.info(f"{t['title']}: re-run analysis to save the calculation inputs and interval.")
+            continue
+        st.markdown(f"**{t['title']}** · Live-size scaling: "
+                    f"**{calc['live_population']:,} / {calc['offline_population']:,} = {calc['live_size_scale']:g}**. "
+                    f"{calc['offline_users_in_test']:,} offline users / {calc['history_span_days']} days "
+                    f"× {calc['live_size_scale']:g} = {calc['daily_users']:.6f} daily users.")
+        for arm in calc["arms"]:
+            st.markdown(f"{calc['daily_users']:.6f} daily users × {arm['losing_share']:.2%} losing arm share "
+                        f"({arm['name']}) × ${arm['gap_per_user']:.2f} revenue gap per user "
+                        f"× {calc['month_days']} = **${arm['monthly_loss_usd']:,.2f}/month**.")
+        ci = t.get("lost_per_month_ci95_usd")
+        if ci:
+            st.markdown(f"95% bootstrap interval: **${ci[0]:,.2f}…${ci[1]:,.2f}/month**.")
+    st.markdown(f"Total on decided live tests: **${r['total_lost_per_month_usd']:,.2f}/month**.")
+    st.caption("Intervals scale the existing two-arm revenue-gap bootstrap with traffic and allocation held fixed. "
+               "Traffic uncertainty is excluded; no aggregate interval is claimed for multi-arm tests.")
 names = r.get("segment_names", {})
 
 
@@ -222,6 +245,9 @@ for t in tests:
         c.markdown("**Why this verdict**\n" + "\n".join(f"- {x}" for x in t["reasons"]))
         if t["state"] == "live":
             c.markdown(f"- Cost of keeping it running: **${t['lost_per_month_usd']:,.0f}/month**")
+            ci = t.get("lost_per_month_ci95_usd")
+            if ci:
+                c.markdown(f"- 95% interval for monthly loss: **${ci[0]:,.2f}…${ci[1]:,.2f}**")
 
         lv = t.get("live_view")
         left, right = st.columns(2)
