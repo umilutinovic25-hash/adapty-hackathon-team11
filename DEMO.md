@@ -6,8 +6,7 @@
 - **Never click Stop on the main Lumen app before the demo.** All rehearsal stops are used up: "Lumen BACKUP" (Main
   13:10, Onboarding 13:56) and, after review round 5, "Lumen BACKUP 2" (b7f823ba-…, 7 Nov: Main through the CLI,
   Onboarding through the dashboard with a named approver; both stopped in Adapty, audited, card turned completed).
-  For another rehearsal: `adapty apps create --title "Lumen BACKUP 3 - …" …`, then
-  `python3 seed_adapty.py --app-id <id> --skip-data` (catalog only, no secret key) and add the id to `OFFLINE_APP_IDS`.
+  For another rehearsal, follow [the exact app creation, `--skip-data` seed and `OFFLINE_APP_IDS` steps](README.md#seed-a-rehearsal-app).
 - On stage, type your name in **Approved by** before ticking the box: the Stop button stays disabled without it.
 - On stage the app opens on **Lumen - AI Photo Editor (Hackathon)** (the default).
 - Backups if Wi-Fi or the Adapty API fail: `~/Downloads/experiment_autopilot_full_stop_flow.gif` (whole flow including
@@ -16,6 +15,8 @@
   `claude -p "Are my Adapty A/B tests decided? What do they cost me? Use the experiment-autopilot skill. Read only: do not stop anything." --allowedTools "Bash(uv run python -m pa.cli check*)" "Skill" "Read"`
   It takes ≈60 s, so **start it at 0:30**, while you talk, and show the answer at 4:15.
 - Numbers for Q&A: `QA.md`.
+- Validation: **66 tests** (`uv run pytest -q`); `bash .claude/verify.sh` also checks the live API and accepts
+  `completed_confirmed` after a successful stop.
 
 | Time | Screen | Say (approximately) |
 |---|---|---|
@@ -24,7 +25,7 @@
 | 1:15–2:15 | App → Main card | "We judge the same tests on 60-day revenue over four months of history. Main: the lifetime anchor earns **$15.99 vs $9.23**, +73%, CI far from zero. Split healthy, groups balanced, refunds and billing issues not worse. **Decided.** Every week at 50/50 costs money." |
 | 2:15–3:00 | Onboarding card → ⏱️ warning + *Revenue maturity* | "Onboarding: Weekly wins on matured revenue too, +90%. Our maturity check shows why the dashboard looked so sure: by day 1 Weekly has 46% of its revenue and Annual trial 0%. Here the early read happened to be right. In another app the same bias picks the wrong winner." |
 | 3:00–3:15 | Segments expander | "Is one winner right for everyone? Our intent model checks low, mid and high purchase intent, plus platform and channel: no segment reverses. One winner for everyone." |
-| 3:15–3:30 | Hero number + summary table | "Together: **≈$1,749 a month**, 28% of today's MRR. Bonus: the completed Settings test isn't significant, and the AI-limit draft would need ~1,500 days at this traffic. Don't start it as designed." |
+| 3:15–3:30 | Hero number + calculation expander + summary table | "Together: **$1,749.31 a month**, expected revenue of new cohorts, with each calculation and interval here. Today's MRR is a size reference. The completed Settings test isn't significant, and the AI-limit draft would need ~1,500 days at this traffic. Don't start it as designed." |
 | 3:30–3:40 | Terminal: refused-stop regression test | "First, a stale approval: the fresh winner changes, or the traffic split fails. Change Guard refuses before the stop adapter is called. This runs entirely on fixtures; it sends nothing to Adapty." |
 | 3:40–4:15 | Main card → Change Guard → tick → **Stop** (≈12 s fresh re-check) → Adapty refresh | "Nothing ships without a human: what changes, who's affected, dollar effect, can't be undone. I approve. *(click)* It re-checks on fresh data first, so a stale plan can't ship. … *(card turns to completed; dashboard)* Winner rolled out, and it's in the audit log." |
 | 4:15–4:40 | Terminal: Claude Code answer | "The same brain works as an agent. I asked Claude Code in plain English whether my tests are decided. It answers with these numbers, flags the immature read, and offers to stop a test only after an explicit yes." |

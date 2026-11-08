@@ -64,7 +64,11 @@ approval).
    trials as $0 and removes refunds, and only users whose 60 days have passed are included.
 3. **Decision**: revenue per user per arm, bootstrap 95% CI, P(winner better), and an always-valid p-value (mixture
    SPRT), so re-checking the same test every day in the dashboard or a cron doesn't inflate false winners. A completed
-   test is "confirmed" only if the health, guardrail and segment checks pass too.
+   test is `completed_confirmed` only if all comparisons and health, guardrail and segment checks pass, and the
+   known applied winner matches the history winner. Verified history that favours another applied arm gives
+   `completed_disagrees`; missing applied-winner metadata gives `completed_winner_unknown`. Neither confirms the
+   rollout. Insufficient revenue evidence gives `completed_inconclusive`; failed safety checks on an otherwise
+   decided completed test give `completed_check_failed`.
 4. **Health** (as in GrowthBook): SRM on the traffic split; randomization balance on a pre-exposure intent score.
 5. **Guardrails** (as in GrowthBook/Eppo): refund rate and billing-issue rate **per charge**. A per-payer rate would
    penalise weekly plans for charging more often. P-values come from a bootstrap over **users**, because renewals
@@ -74,12 +78,21 @@ approval).
 7. **Segments**: the same comparison inside intent (low/mid/high from a cross-fitted gradient-boosting model on
    day-one signals), platform and acquisition channel, Bonferroni-corrected.
 8. **Planning**: sample size for a 10% lift, days to a decision, and the smallest lift visible in 30 days, using
-   only the traffic of the draft's own placement.
-   Tests with 3+ arms compare the winner with the runner-up and count money on every losing arm. The revenue horizon
-   is read from the test goal ("…60-day revenue…"), with 60 days as the default.
+   only the traffic of the draft's own placement and its smallest configured arm share. Enrolment days are
+   `n / (daily users × smallest share)`, plus the revenue window; the 30-day MDE uses the same share. Missing history,
+   insufficient matured users, or no usable traffic/allocation gives **can't size**, never a recommendation to start.
+   Tests with 3+ arms compare the winner with **every** losing arm: bootstrap CI, always-valid p, guardrails and
+   segments must pass for each comparison before rollout. An unverified revenue comparison leaves `keep_running`;
+   failed health/guardrail/segment checks retain their non-actionable verdicts. Money counts only verified losing
+   arms. The revenue horizon is read from the test goal ("…60-day revenue…"), with 60 days as the default.
 9. **Change Guard**: shows what changes, the audience, who is affected, the expected effect, and that a stop can't be
    undone. After approval by a named person it re-judges on fresh data, runs `adapty ab-tests stop <id> --winner <id>`
    and appends to `out/audit.log`. The CLI and the dashboard share this one path.
+
+The dashboard labels **Adapty API (live)**, **synthetic history**, and **saved report (offline)** by section, with
+the UTC analysis time and last date covered by history. Opening a saved report shows its age; re-run analysis to
+refresh it. The hero expander retains the unrounded traffic inputs, the 5k/50k scaling, per-arm revenue gaps and
+two-arm 95% monthly loss intervals. These estimate the revenue of new cohorts over the test horizon, not MRR.
 
 ## Run
 
@@ -91,8 +104,31 @@ uv run python -m pa.cli check        # Markdown brief (writes out/report.json)
 uv run python -m pa.cli portfolio    # every app the Adapty account can open
 uv run python -m pa.cli notify       # Slack digest: posts if SLACK_WEBHOOK_URL is set, else saves a preview
 uv run streamlit run app.py          # dashboard (app selector, Slack preview, portfolio scan)
-sh .claude/verify.sh                 # checks; asserts the pre-demo verdicts, so it fails once a test is stopped
+bash .claude/verify.sh               # compile, tests and live checks; accepts completed_confirmed after a stop
 ```
+
+### Seed a rehearsal app
+
+From this repository, with the Adapty CLI logged in and the seed repo at
+`../hackaton_adapty/adapty-seed-data-hack`, create a fresh copy. Use a new title and bundle IDs for later copies:
+
+```bash
+adapty apps create --title "Lumen BACKUP 3 - rehearsal" \
+  --platform ios --apple-bundle-id com.example.lumen.rehearsal3 \
+  --platform android --google-bundle-id com.example.lumen.rehearsal3 --json
+REHEARSAL_APP_ID="<id from apps create>"
+python3 ../hackaton_adapty/adapty-seed-data-hack/seed_adapty.py \
+  --app-id "$REHEARSAL_APP_ID" --skip-data
+export OFFLINE_APP_IDS="${OFFLINE_APP_IDS:+$OFFLINE_APP_IDS,}$REHEARSAL_APP_ID"
+uv run python -m pa.cli check --app "$REHEARSAL_APP_ID"
+uv run streamlit run app.py
+```
+
+Select the new app, or open `http://localhost:8501/?app=<id>`. Keep the exported variable in the shell that starts
+the CLI and Streamlit; this appends the rehearsal ID to any existing comma-separated history apps. The default
+Lumen app always keeps its history. `--skip-data` creates the catalog, flows, placements, segments and tests;
+it does not replay users or purchases and needs no secret API key. Its matured results use the same synthetic
+offline history. Leave the main Lumen tests live for the demo.
 
 ### For AI agents (Claude Code)
 
@@ -101,9 +137,10 @@ sh .claude/verify.sh                 # checks; asserts the pre-demo verdicts, so
 refuses if the verdict changed or the fresh winner differs from the approved one, then writes the audit log. The
 dashboard's Stop button applies the same fresh re-check.
 
-Tests: `uv run pytest` runs 18 behaviour tests with the Adapty CLI mocked from fixtures. They cover the post-stop
-state, a stale approval, paywall tests, odd arm weights, 3-arm tests, other apps without history, test-only live
-metrics and the Slack digest.
+Tests: `uv run pytest -q` runs **66 behaviour tests**, including dashboard rendering, with the Adapty CLI mocked
+from fixtures. They cover the post-stop state, fresh-winner and health refusals, applied-winner confirmation,
+multi-arm outliers and safety checks, weighted draft sizing, source/freshness labels, auditable loss intervals,
+other apps without history, test-only live metrics and the Slack digest.
 
 ## Limits
 
@@ -111,6 +148,15 @@ metrics and the Slack digest.
   export). Without it the tool still shows the live view and the plans.
 - Paywall-type tests are listed as "can't judge on history yet" with what Adapty sees; the offline dataset has flows only.
 - Dollar figures are scaled to Lumen's live size (5k of 50k offline users).
+- Monthly loss intervals scale the existing two-arm revenue-gap bootstrap with traffic and allocation held fixed;
+  they exclude traffic uncertainty. There is no aggregate multi-arm interval. The estimate is expected revenue of
+  new cohorts over the horizon, not MRR.
+- A history winner cannot establish which arm was applied. If the API omits applied-winner metadata, a completed
+  result stays `completed_winner_unknown`; if a verified history winner differs, it is `completed_disagrees`.
+  An acknowledged Change Guard stop records the applied ID in the saved report; a later API rebuild needs that
+  metadata again.
+- Segments with fewer than 80 users per compared arm are skipped. Unclear segment intervals are not reversals;
+  rollout does not prove a positive lift in every small segment.
 - SRM uses the arm weights as configured now; Adapty keeps no weight history, so a split changed mid-test can show
   up as SRM. Arms at weight 0 are left out of the check.
 - The history belongs to the earliest started test with a given title; a later copy is listed with what Adapty sees
