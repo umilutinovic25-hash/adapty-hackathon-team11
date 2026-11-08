@@ -3,9 +3,12 @@
 **Before going on stage**
 - `uv run python -m pa.cli check` (fresh report), then `uv run streamlit run app.py`
 - Tabs, in this order: slide · Streamlit app · Adapty dashboard → A/B tests (Lumen) · terminal in the repo
-- **Never click Stop on the main Lumen app before the demo.** Both rehearsal stops on "Lumen BACKUP" are used up
-  (Main 13:10, Onboarding 13:56, both worked end to end). For another rehearsal, seed a new copy and add its id to
-  `OFFLINE_APP_IDS`.
+- **Never click Stop on the main Lumen app before the demo.** All rehearsal stops are used up: "Lumen BACKUP" (Main
+  13:10, Onboarding 13:56) and, after review round 5, "Lumen BACKUP 2" (b7f823ba-…, 7 Nov: Main through the CLI,
+  Onboarding through the dashboard with a named approver; both stopped in Adapty, audited, card turned completed).
+  For another rehearsal: `adapty apps create --title "Lumen BACKUP 3 - …" …`, then
+  `python3 seed_adapty.py --app-id <id> --skip-data` (catalog only, no secret key) and add the id to `OFFLINE_APP_IDS`.
+- On stage, type your name in **Approved by** before ticking the box: the Stop button stays disabled without it.
 - On stage the app opens on **Lumen - AI Photo Editor (Hackathon)** (the default).
 - Backups if Wi-Fi or the Adapty API fail: `~/Downloads/experiment_autopilot_full_stop_flow.gif` (whole flow including
   the stop, recorded on the rehearsal copy) and `docs/dashboard.jpg`. The app also opens the last saved analysis offline.
